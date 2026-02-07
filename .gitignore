@@ -17,6 +17,8 @@ logs/
 .vscode/
 .idea/
 .DS_Store
+.cache/
+.clangd/
 
 # Temporary files
 tmp/
