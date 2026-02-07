@@ -1,0 +1,47 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-I./include",
+      "-O3",
+      "-march=native",
+      "-funroll-loops",
+      "-mtune=native",
+      "-pg",
+      "exec.cpp"
+    ],
+    "directory": "/home/tututu/qimeng/simpoint_sim",
+    "file": "/home/tututu/qimeng/simpoint_sim/exec.cpp"
+  },
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-I./include",
+      "-O3",
+      "-march=native",
+      "-funroll-loops",
+      "-mtune=native",
+      "-pg",
+      "main.cpp"
+    ],
+    "directory": "/home/tututu/qimeng/simpoint_sim",
+    "file": "/home/tututu/qimeng/simpoint_sim/main.cpp"
+  },
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-I./include",
+      "-O3",
+      "-march=native",
+      "-funroll-loops",
+      "-mtune=native",
+      "-pg",
+      "simpoint.cpp"
+    ],
+    "directory": "/home/tututu/qimeng/simpoint_sim",
+    "file": "/home/tututu/qimeng/simpoint_sim/simpoint.cpp"
+  }
+]

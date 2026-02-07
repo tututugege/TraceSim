@@ -1,0 +1,22 @@
+# Build artifacts
+a.out
+TraceSim_gdb
+*.o
+*.d
+
+# Test files and data
+test/
+*.bin
+*.gz
+
+# Logs
+*.log
+logs/
+
+# IDE and system files
+.vscode/
+.idea/
+.DS_Store
+
+# Temporary files
+tmp/
