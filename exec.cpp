@@ -2,41 +2,104 @@
 #include "RISCV.h"
 #include "ref.h"
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 
-// Removed load_simpoints declaration
+namespace {
+constexpr uint32_t kRamBase = 0x80000000u;
+constexpr uint32_t kRamUpperBound = 0xC0000000u;
+constexpr uint32_t kRamSizeBytes = kRamUpperBound - kRamBase;
+
+[[noreturn]] void mem_oob_fatal(const char *op, uint32_t addr, uint32_t size) {
+  std::cerr << "[RefCPU] " << op << " out-of-bounds: addr=0x" << std::hex
+            << addr << ", size=" << std::dec << size
+            << ", required: addr + size <= 0xC0000000" << std::endl;
+  exit(1);
+}
+
+inline void check_mem_range_or_die(const char *op, uint32_t addr,
+                                   uint32_t size) {
+  if (size == 0) {
+    return;
+  }
+  const uint64_t end =
+      static_cast<uint64_t>(addr) + static_cast<uint64_t>(size) - 1;
+  if (end >= kRamUpperBound) {
+    mem_oob_fatal(op, addr, size);
+  }
+}
+
+inline bool is_ram_range(uint32_t addr, uint32_t size) {
+  if (size == 0 || addr < kRamBase) {
+    return false;
+  }
+  const uint64_t end =
+      static_cast<uint64_t>(addr) + static_cast<uint64_t>(size) - 1;
+  return end < kRamUpperBound;
+}
+} // namespace
+
+std::map<uint32_t, uint32_t> load_simpoints(const std::string &filename);
+
+Ref_cpu::~Ref_cpu() {
+  if (memory) {
+    free(memory);
+  }
+}
 
 void Ref_cpu::init(uint32_t reset_pc, const char *image, uint32_t size) {
   state.pc = reset_pc;
   ram_size = size;
-  memory = new uint32_t[ram_size];
+  if (ram_size != kRamSizeBytes) {
+    std::cerr << "[RefCPU] Unsupported RAM size: 0x" << std::hex << ram_size
+              << ", expected 0x" << kRamSizeBytes << std::dec << std::endl;
+    exit(1);
+  }
+
+  const uint32_t ram_words = ram_size / sizeof(uint32_t);
+  memory = (uint32_t *)calloc(ram_words, sizeof(uint32_t));
+  if (!memory) {
+    std::cerr << "Error: Could not allocate " << ram_size
+              << " bytes of memory" << std::endl;
+    exit(1);
+  }
+  io_words.clear();
 
   if (image && *image) {
-    std::ifstream inst_data(image, std::ios::in);
+    std::ifstream inst_data(image, std::ios::in | std::ios::binary);
     if (!inst_data.is_open()) {
-      std::cout << "Error: Image " << image << " does not exist" << std::endl;
-      exit(0);
+      std::cerr << "Error: Image " << image << " does not exist" << std::endl;
+      exit(1);
     }
 
     inst_data.seekg(0, std::ios::end);
     std::streamsize img_size = inst_data.tellg();
     inst_data.seekg(0, std::ios::beg);
 
-    assert(img_size / 4 < ram_size);
-    if (!inst_data.read(reinterpret_cast<char *>(memory + 0x80000000 / 4),
-                        img_size)) {
+    if (img_size < 0 || static_cast<uint64_t>(img_size) > kRamSizeBytes) {
+      std::cerr << "[RefCPU] Image too large for 1GB RAM window: " << img_size
+                << " bytes" << std::endl;
+      exit(1);
+    }
+    const uint32_t img_bytes = static_cast<uint32_t>(img_size);
+    check_mem_range_or_die("image load", kRamBase, img_bytes);
+
+    std::cout << "[RefCPU] Loading image at 0x80000000, size: " << img_size
+              << " bytes" << std::endl;
+    if (!inst_data.read(reinterpret_cast<char *>(memory), img_bytes)) {
       std::cerr << "读取文件失败！" << std::endl;
       exit(1);
     }
+
     inst_data.close();
   }
 
-  memory[0x10000004 / 4] = 0x00006000; // 和进入 OpenSBI 相关
-  memory[uint32_t(0x0 / 4)] = 0xf1402573;
-  memory[uint32_t(0x4 / 4)] = 0x83e005b7;
-  memory[uint32_t(0x8 / 4)] = 0x800002b7;
-  memory[uint32_t(0xc / 4)] = 0x00028067;
+  store_word(0x10000004, 0x00006000); // 和进入 OpenSBI 相关
+  store_word(0x0, 0xf1402573);
+  store_word(0x4, 0x83e005b7);
+  store_word(0x8, 0x800002b7);
+  store_word(0xc, 0x00028067);
 
   for (int i = 0; i < 32; i++) {
     state.gpr[i] = 0;
@@ -44,7 +107,7 @@ void Ref_cpu::init(uint32_t reset_pc, const char *image, uint32_t size) {
   for (int i = 0; i < 21; i++) {
     state.csr[i] = 0;
   }
-  state.csr[csr_misa] = 0x40141101;
+  state.csr[csr_misa] = 0x40141103;
   privilege = 0b11;
 
   state.store = false;
@@ -52,22 +115,63 @@ void Ref_cpu::init(uint32_t reset_pc, const char *image, uint32_t size) {
   page_fault_inst = false;
   page_fault_load = false;
   page_fault_store = false;
+  state.reserve_valid = false;
+  state.reserve_addr = 0;
   sim_time = 0;
 }
 
 void Ref_cpu::exec(const SimConfig &config) {
+  // 准备 GEN_CHECKPOINT 需要的 target_intervals
+  std::map<uint32_t, uint32_t> target_intervals;
+  uint32_t finished_intervals = 0;
+
+  if (config.mode == SimMode::GEN_CHECKPOINT) {
+    target_intervals = load_simpoints(config.points_file);
+
+    // [特殊处理] Interval 0 无法向前预热，只能直接保存
+    // 如果 SimPoint 选中了 0，我们只能保存刚启动的状态
+    if (target_intervals.count(0)) {
+      uint32_t sp_id = target_intervals[0];
+      std::string ckpt_name = config.checkpoint_dir + "/ckpt_sp" +
+                              std::to_string(sp_id) +
+                              "_target0_nowarmup.gz"; // 建议加上.gz后缀
+      save_checkpoint(ckpt_name);
+    }
+  } else if (config.mode == SimMode::GEN_BBV) {
+    bbv_init_file(config.bbv_output_file.c_str());
+  } else if (config.mode == SimMode::RESTORE) {
+    restore_checkpoint(config.restore_file);
+  }
+
   uint64_t restored_inst_count = 0;
 
-  // --- Main Loop ---
+  // --- 主循环 ---
   while (!sim_end && sim_time < MAX_SIM_TIME) {
-    if (sim_time % 100000000 == 0) {
-      std::cout << "SimTime: " << sim_time << std::endl;
+
+    if (sim_time % 10000000000ULL == 0) {
+      std::cout << "SimTime: " << sim_time
+                << " | Intervals: " << finished_intervals << std::endl;
     }
 
-    // Process one instruction
-    step();
+    // 1. 执行指令
+    RISCV();
 
-    // Check instruction limit for restore mode
+    if (sim_end)
+      break;
+
+    sim_time++;
+
+    // 2. 计数逻辑 (保持和你生成 BBV 时一致，这对 SimPoint 对齐至关重要)
+    if (privilege == RISCV_MODE_U && is_br) {
+      if (config.mode == SimMode::GEN_BBV) {
+        bbv_commit(); // 更新内存中的 bbv_counts
+      }
+      // 这里的 interval_inst_count 决定了 Interval 的边界
+      interval_inst_count += current_bb_len;
+      current_bb_len = 0;
+    }
+
+    // 3. RESTORE 模式的指令数限制检查 (用于跑 Warmup + Sampling)
     if (config.mode == SimMode::RESTORE && config.max_insts > 0) {
       restored_inst_count++;
       if (restored_inst_count >= config.max_insts) {
@@ -75,33 +179,81 @@ void Ref_cpu::exec(const SimConfig &config) {
         break;
       }
     }
+
+    // 4. Interval 边界处理
+    if (interval_inst_count >= INTERVAL_SIZE) {
+      // 当前 Interval (finished_intervals) 刚刚结束
+      finished_intervals++;
+
+      // 即将开始的 Interval 编号
+      // 例如：finished_intervals 变成 1823，说明我们要开始跑 Interval 1823 了
+      uint32_t upcoming_interval_id = finished_intervals;
+
+      // --- 模式分支处理 ---
+
+      if (config.mode == SimMode::GEN_BBV) {
+        std::cout << "Dump BBV at interval boundary: " << upcoming_interval_id
+                  << std::endl;
+        dump_bbv();
+      } else if (config.mode == SimMode::GEN_CHECKPOINT) {
+        // [Warmup 逻辑核心修改]
+        // 我们不检查 upcoming_interval_id 是否是目标，
+        // 而是检查 (upcoming_interval_id + 1) 是否是目标。
+        // 如果是，说明当前这个 Interval (upcoming_interval_id) 就是那个 Warmup
+        // 区间。 我们需要在进入 Warmup 区间之前保存 Checkpoint。
+
+        uint32_t target_id = upcoming_interval_id + 1; // Lookahead (向前看一个)
+
+        auto it = target_intervals.find(target_id);
+        if (it != target_intervals.end()) {
+          uint32_t sp_id = it->second;
+
+          // 文件名命名建议：明确标出这是 target 谁的 warmup
+          std::string ckpt_name = config.checkpoint_dir + "/ckpt_sp" +
+                                  std::to_string(sp_id) + "_target" +
+                                  std::to_string(target_id) +
+                                  "_warmup1.gz"; // warmup1 代表预热长度为1
+
+          std::cout << "Creating Warmup Checkpoint for Target " << target_id
+                    << std::endl;
+          save_checkpoint(ckpt_name);
+
+          // 优化：如果最大的目标都已经生成过预热快照了，就可以退出了
+          // 注意：target_intervals 是有序 map，rbegin() 是最大的 key
+          if (!target_intervals.empty() &&
+              target_id >= target_intervals.rbegin()->first) {
+            std::cout << "All checkpoints generated. Simulation finished."
+                      << std::endl;
+            sim_end = true;
+          }
+        }
+      }
+
+      // 重置区间指令计数
+      interval_inst_count = 0;
+    }
+  }
+
+  if (sim_time >= MAX_SIM_TIME) {
+    std::cerr << "Error: Simulation Timeout! (MAX_SIM_TIME = " << MAX_SIM_TIME
+              << " reached)" << std::endl;
+    exit(1);
+  }
+
+  // --- 结束清理 ---
+  if (config.mode == SimMode::GEN_BBV) {
+    if (bbv_file.is_open())
+      bbv_file.close();
   }
 }
 
 TraceInst Ref_cpu::step() {
-  // Reset trace info
   current_trace = {};
   current_trace.is_wfi = false;
   current_trace.is_ebreak = false;
-  
-  // Execute one instruction
+  current_trace.is_trap = false;
   RISCV();
   sim_time++;
-
-  // Capture basic info (PC is updated in RISCV, so we might need the PC *before* execution or track it inside)
-  // Actually, RISCV() updates state.pc to next_pc at the end. 
-  // We should capture the PC of the instruction *just executed*.
-  // However, RISCV() doesn't easily return the old PC unless we track it.
-  // The structure of RISCV() in exec.cpp:
-  //   uint32_t p_addr = state.pc;
-  //   Instruction = memory[p_addr >> 2];
-  //   ... decoding ...
-  //   execution ...
-  //   state.pc = next_pc;
-  
-  // So 'current_trace' needs to be populated *inside* RISCV() or its helpers 
-  // while the information is available.
-  
   return current_trace;
 }
 
@@ -265,7 +417,7 @@ void Ref_cpu::exception(uint32_t trap_val) {
     state.csr[csr_sstatus] = sstatus;
     // 更新 mstatus 中对应的位 (SPIE, SIE, SPP 在 mstatus 中也有对应位置)
     // 简单做法：读出改完的 sstatus，把对应位刷回 mstatus
-    uint32_t mask = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP;
+    uint32_t mask = 0x800DE133;
     state.csr[csr_mstatus] =
         (state.csr[csr_mstatus] & ~mask) | (sstatus & mask);
 
@@ -289,8 +441,7 @@ void Ref_cpu::exception(uint32_t trap_val) {
 
     state.csr[csr_mstatus] = mstatus;
     // 同步 sstatus
-    state.csr[csr_sstatus] =
-        mstatus & 0x800DE762; // 仅示意，实际上 RISC-V 硬件会自动映射
+    state.csr[csr_sstatus] = mstatus & 0x800DE133;
 
     next_pc = state.csr[csr_mepc];
 
@@ -311,7 +462,7 @@ void Ref_cpu::exception(uint32_t trap_val) {
 
     state.csr[csr_sstatus] = sstatus;
     // 同步回 mstatus
-    uint32_t mask = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP;
+    uint32_t mask = 0x800DE133;
     state.csr[csr_mstatus] =
         (state.csr[csr_mstatus] & ~mask) | (sstatus & mask);
 
@@ -323,23 +474,20 @@ void Ref_cpu::exception(uint32_t trap_val) {
 
 void Ref_cpu::RISCV() {
   if (privilege == RISCV_MODE_U) {
-    // BBV logic removed
+    if (current_bb_len == 0) {
+      current_bb_head_pc = state.pc;
+    }
+    current_bb_len++;
   }
 
   is_csr = is_exception = is_br = br_taken = false;
   illegal_exception = page_fault_load = page_fault_inst = page_fault_store =
       asy = false;
   state.store = false;
-
+  is_io = false;
+  force_sync = false;
 
   uint32_t p_addr = state.pc;
-  
-  // Capture Trace basic info
-  current_trace.pc = state.pc;
-  current_trace.is_branch = false;
-  current_trace.is_load = false;
-  current_trace.is_store = false;
-
 
   if ((state.csr[csr_satp] & 0x80000000) && privilege != 3) {
     page_fault_inst = !va2pa(p_addr, state.pc, 0);
@@ -347,22 +495,38 @@ void Ref_cpu::RISCV() {
     if (page_fault_inst) {
       exception(state.pc);
       return;
-    } else {
-      Instruction = memory[p_addr >> 2];
     }
-  } else {
-    Instruction = memory[p_addr >> 2];
   }
-  
+  check_mem_range_or_die("instruction fetch", p_addr, 4);
+  Instruction = load_word(p_addr);
+
+  // Trace header (must be filled before decode/execute).
+  current_trace.pc = state.pc;
   current_trace.opcode = BITS(Instruction, 6, 0);
-  current_trace.rd = BITS(Instruction, 11, 7);
-  // RS1/RS2 will be set in specific helpers or we can just extract them always since it's cheap
-  current_trace.rs1 = BITS(Instruction, 19, 15);
-  current_trace.rs2 = BITS(Instruction, 24, 20);
+  // Use semantic register usage (not raw bitfields) to avoid false RAW deps.
+  current_trace.rd = 0;
+  current_trace.rs1 = 0;
+  current_trace.rs2 = 0;
+  current_trace.is_branch = false;
+  current_trace.branch_taken = false;
+  current_trace.target = 0;
+  current_trace.is_load = false;
+  current_trace.is_store = false;
+  current_trace.is_trap = false;
+  current_trace.mem_addr = 0;
 
   if (Instruction == INST_EBREAK) {
-    state.pc += 4;
-    std::cout << "sim_time: " << sim_time << std::endl;
+    current_trace.is_ebreak = true;
+    uint32_t exit_code = state.gpr[10]; // a0
+    std::cout << "ebreak signal received. code = 0x" << std::hex << exit_code
+              << std::dec << std::endl;
+    std::cout << "total_sim_time: " << sim_time << std::endl;
+    if (exit_code == 0) {
+      std::cout << "\033[1;32mSuccess!\033[0m" << std::endl;
+    } else {
+      std::cout << "\033[1;31mTest Failed with code: " << exit_code << "\033[0m"
+                << std::endl;
+    }
     sim_end = true;
     return;
   }
@@ -448,23 +612,26 @@ void Ref_cpu::RISCV() {
 
   asy = MTrap || STrap || mret || sret;
 
-  // WFI/EBREAK 检查 (简单处理)
-  if (Instruction == INST_EBREAK) {
-    current_trace.is_ebreak = true;
-    sim_end = true;
-  }
+  // WFI 检查 (简单处理)
   if (Instruction == INST_WFI && !asy && !page_fault_inst && !page_fault_load &&
       !page_fault_store) {
-    current_trace.is_wfi = true;
-    sim_end = true;
+    std::cout << " WFI " << std::endl;
+    std::cout << sim_time << std::endl;
+    exit(1);
   }
 
   if (page_fault_inst) {
+    current_trace.is_trap = true;
     exception(state.pc);
+    return;
   } else if (illegal_exception) {
+    current_trace.is_trap = true;
     exception(Instruction);
+    return;
   } else if (asy || Instruction == INST_ECALL) {
+    current_trace.is_trap = true;
     exception(0);
+    return;
   } else if (opcode == number_10_opcode_ecall) {
     // SYSTEM 指令 (CSR, WFI, MRET等)
     if (Instruction == INST_WFI) {
@@ -478,6 +645,8 @@ void Ref_cpu::RISCV() {
   } else {
     RV32IM();
   }
+  current_trace.is_branch = is_br;
+  current_trace.branch_taken = br_taken;
   state.gpr[0] = 0;
 }
 
@@ -494,10 +663,14 @@ void Ref_cpu::RV32CSR() {
 
   uint32_t reg_rdata1 = state.gpr[rs1];
 
+  current_trace.rd = rd;
+  current_trace.rs1 = (funct3 & 0b100) ? 0 : rs1; // immediate CSR ops don't read GPR
+  current_trace.rs2 = 0;
+
   bool we = funct3 == 1 || rs1 != 0;
   bool re = funct3 != 1 || rd != 0;
   uint32_t wcmd = funct3 & 0b11;
-  uint32_t csr_wdata, wdata;
+  uint32_t csr_wdata = 0, wdata;
 
   if (funct3 & 0b100) {
     wdata = rs1;
@@ -530,48 +703,64 @@ void Ref_cpu::RV32CSR() {
     }
 
     if (we) {
-      uint32_t csr_wdata;
+      uint32_t old_val = state.csr[csr_idx];
       if (wcmd == CSR_W) {
         csr_wdata = wdata;
       } else if (wcmd == CSR_S) {
-        csr_wdata = wdata | (~wdata & state.csr[csr_idx]);
+        csr_wdata = old_val | wdata;
       } else if (wcmd == CSR_C) {
-        csr_wdata = (~wdata & state.csr[csr_idx]);
+        csr_wdata = old_val & ~wdata;
       }
 
       if (csr_idx == csr_mie || csr_idx == csr_sie) {
-        if (csr_idx == csr_sie)
-          csr_wdata =
-              (state.csr[csr_mie] & 0xfffffccc) | (csr_wdata & 0x00000333);
-        else
-          csr_wdata =
-              (state.csr[csr_mie] & 0xfffff444) | (csr_wdata & 0x00000bbb);
+        uint32_t mie_mask =
+            0x00000bbb; // MEI(11), SEI(9), MTI(7), STI(5), MSI(3), SSI(1)
+        uint32_t sie_mask =
+            0x00000333; // SEI(9), UEI(8), STI(5), UTI(4), SSI(1), USI(0)
 
-        state.csr[csr_mie] = csr_wdata;
-        state.csr[csr_sie] = csr_wdata;
-      } else if (csr_idx == number_mip || csr_idx == number_sip) {
+        if (csr_idx == csr_sie) {
+          // sie: 0x333 (Include User-Level Interrupt bits)
+          state.csr[csr_mie] =
+              (state.csr[csr_mie] & ~sie_mask) | (csr_wdata & sie_mask);
+        } else {
+          // mie: 0xbbb
+          state.csr[csr_mie] = csr_wdata & mie_mask;
+        }
+        // sie 始终是 mie 的影子 (masked by 0x333)
+        state.csr[csr_sie] = state.csr[csr_mie] & sie_mask;
 
-        if (csr_idx == number_mip)
-          csr_wdata =
-              (state.csr[csr_mip] & 0xfffffccc) | (csr_wdata & 0x00000333);
-        else
-          csr_wdata =
-              (state.csr[csr_mip] & 0xfffff444) | (csr_wdata & 0x00000bbb);
+      } else if (csr_idx == csr_mip || csr_idx == csr_sip) {
+        uint32_t mip_mask =
+            0x00000bbb; // MEIP(11), SEIP(9), MTIP(7), STIP(5), MSIP(3), SSIP(1)
+        uint32_t sip_mask =
+            0x00000333; // SEIP(9), UEIP(8), STIP(5), UTIP(4), SSIP(1), USIP(0)
 
-        state.csr[csr_mip] = csr_wdata;
-        state.csr[csr_sip] = csr_wdata;
+        if (csr_idx == csr_sip) {
+          // sip: 0x333 (Include User-Level Interrupt bits)
+          state.csr[csr_mip] =
+              (state.csr[csr_mip] & ~sip_mask) | (csr_wdata & sip_mask);
+        } else {
+          state.csr[csr_mip] = csr_wdata & mip_mask;
+        }
+        force_sync = true;
+        // sip 始终是 mip 的影子 (masked by 0x333)
+        state.csr[csr_sip] = state.csr[csr_mip] & sip_mask;
+
       } else if (csr_idx == csr_mstatus || csr_idx == csr_sstatus) {
+        uint32_t mstatus_mask = 0x807FF9BB; // ~0x7f800644
+        uint32_t sstatus_mask = 0x800DE133;
 
         if (csr_idx == csr_sstatus) {
-          csr_wdata = (state.csr[csr_sstatus] & 0x7ff21ecc) |
-                      (csr_wdata & (~0x7ff21ecc));
+          // sstatus 写入：仅修改 mstatus 中属于 sstatus 掩码范围内的位
+          state.csr[csr_mstatus] = (state.csr[csr_mstatus] & ~sstatus_mask) |
+                                   (csr_wdata & sstatus_mask);
         } else {
-          csr_wdata = (state.csr[csr_mstatus] & 0x7f800644) |
-                      (csr_wdata & (~0x7f800644));
+          // mstatus 写入：应用 mstatus 写掩码
+          state.csr[csr_mstatus] = (state.csr[csr_mstatus] & ~mstatus_mask) |
+                                   (csr_wdata & mstatus_mask);
         }
-
-        state.csr[csr_mstatus] = csr_wdata;
-        state.csr[csr_sstatus] = csr_wdata;
+        // 同步更新 sstatus 影子值
+        state.csr[csr_sstatus] = state.csr[csr_mstatus] & sstatus_mask;
 
       } else {
         state.csr[csr_idx] = csr_wdata;
@@ -593,8 +782,24 @@ void Ref_cpu::RV32A() {
   uint32_t reg_rdata1 = state.gpr[reg_a_index];
   uint32_t reg_rdata2 = state.gpr[reg_b_index];
 
+  current_trace.rd = reg_d_index;
+  current_trace.rs1 = reg_a_index;
+  current_trace.rs2 = reg_b_index;
+
   uint32_t v_addr = reg_rdata1;
   uint32_t p_addr = v_addr;
+  current_trace.mem_addr = v_addr;
+  // For the timing model, AMO/SC are treated as LSU-store-class ops,
+  // LR is treated as LSU-load-class op. This guarantees they enter some IQ.
+  current_trace.is_load = (funct5 == 2);
+  current_trace.is_store = (funct5 != 2);
+  current_trace.is_trap = (p_addr < 0x80000000);
+
+  if (p_addr % 4 != 0) {
+    std::cerr << "Misaligned AMO Access! addr: 0x" << std::hex << v_addr
+              << std::endl;
+    exit(-1);
+  }
 
   if ((state.csr[csr_satp] & 0x80000000) && privilege != 3) {
     bool page_fault_1 = !va2pa(p_addr, v_addr, 1);
@@ -615,78 +820,86 @@ void Ref_cpu::RV32A() {
     }
 
     if (page_fault_load || page_fault_store) {
+      current_trace.is_trap = true;
       exception(v_addr);
       return;
     }
   }
+  check_mem_range_or_die("amo", p_addr, 4);
 
   if (funct5 != 2) {
     state.store = true;
     state.store_addr = p_addr;
     state.store_strb = 0b1111;
   }
+  uint32_t old_word = load_word(p_addr);
 
   switch (funct5) {
   case 0: { // amoadd.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = memory[p_addr >> 2] + reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data = old_word + reg_rdata2;
     break;
   }
   case 1: { // amoswap.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
+    state.gpr[reg_d_index] = old_word;
     state.store_data = reg_rdata2;
     break;
   }
   case 2: { // lr.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
+    state.gpr[reg_d_index] = old_word;
+    state.reserve_valid = true;
+    state.reserve_addr = p_addr;
     break;
   }
   case 3: { // sc.w
-    state.store_data = reg_rdata2;
-    state.gpr[reg_d_index] = 0;
+    if (state.reserve_valid && state.reserve_addr == p_addr) {
+      state.store_data = reg_rdata2;
+      state.gpr[reg_d_index] = 0; // Success
+    } else {
+      state.gpr[reg_d_index] = 1; // Fail
+      state.store = false;        // Don't perform the write
+    }
+    state.reserve_valid =
+        false; // Regardless of success, invalidate reservation
     break;
   }
   case 4: { // amoxor.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = memory[p_addr >> 2] ^ reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data = old_word ^ reg_rdata2;
     break;
   }
   case 8: { // amoor.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = memory[p_addr >> 2] | reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data = old_word | reg_rdata2;
     break;
   }
   case 12: { // amoand.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = memory[p_addr >> 2] & reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data = old_word & reg_rdata2;
     break;
   }
   case 16: { // amomin.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = ((int32_t)memory[p_addr >> 2] > (int32_t)reg_rdata2)
-                           ? reg_rdata2
-                           : memory[p_addr >> 2];
+    state.gpr[reg_d_index] = old_word;
+    state.store_data =
+        ((int32_t)old_word > (int32_t)reg_rdata2) ? reg_rdata2 : old_word;
     break;
   }
   case 20: { // amomax.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = ((int32_t)memory[p_addr >> 2] > (int32_t)reg_rdata2)
-                           ? memory[p_addr >> 2]
-                           : reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data =
+        ((int32_t)old_word > (int32_t)reg_rdata2) ? old_word : reg_rdata2;
     break;
   }
   case 24: { // amominu.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = ((uint32_t)memory[p_addr >> 2] < (uint32_t)reg_rdata2)
-                           ? memory[p_addr >> 2]
-                           : reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data =
+        ((uint32_t)old_word < (uint32_t)reg_rdata2) ? old_word : reg_rdata2;
     break;
   }
   case 28: { // amomaxu.w
-    state.gpr[reg_d_index] = memory[p_addr >> 2];
-    state.store_data = ((uint32_t)memory[p_addr >> 2] > (uint32_t)reg_rdata2)
-                           ? memory[p_addr >> 2]
-                           : reg_rdata2;
+    state.gpr[reg_d_index] = old_word;
+    state.store_data =
+        ((uint32_t)old_word > (uint32_t)reg_rdata2) ? old_word : reg_rdata2;
     break;
   }
   default: {
@@ -694,33 +907,9 @@ void Ref_cpu::RV32A() {
   }
   }
 
-  // Atomic operations generally involve a load and a store.
-  // We can simplify and mark them as Store for dependency purposes, 
-  // or Load+Store if we supported it. 
-  // Let's mark as Store to be safe for memory dependencies.
-  if (funct5 != 2) { // Not LR.W
-    current_trace.is_store = true;
-    current_trace.mem_addr = p_addr;
+  if (state.store) {
+    store_data();
   }
-  // LR.W is a load
-  if (funct5 == 2) {
-    current_trace.is_load = true;
-    current_trace.mem_addr = p_addr;
-  } else if (funct5 == 3) { // SC.W
-      // SC is conditional store
-      current_trace.is_store = true;
-      current_trace.mem_addr = p_addr;
-  } else {
-      // AMOs are Read-Modify-Write. Mark as Store (which implies a Write)
-      // For dependency tracking in a simple simulator, Store is usually the barrier.
-      current_trace.is_load = true; // AMOs also read
-      current_trace.is_store = true;
-      current_trace.mem_addr = p_addr;
-  }
-
-
-
-  store_data();
   state.pc = next_pc;
 }
 
@@ -737,6 +926,36 @@ void Ref_cpu::RV32IM() {
   uint32_t reg_rdata1 = state.gpr[reg_a_index];
   uint32_t reg_rdata2 = state.gpr[reg_b_index];
 
+  // Semantic source/destination register mapping to avoid false deps.
+  current_trace.rd = 0;
+  current_trace.rs1 = 0;
+  current_trace.rs2 = 0;
+  switch (opcode) {
+  case number_0_opcode_lui:
+  case number_1_opcode_auipc:
+  case number_2_opcode_jal:
+    current_trace.rd = reg_d_index;
+    break;
+  case number_3_opcode_jalr:
+  case number_5_opcode_lb:
+  case number_7_opcode_addi:
+    current_trace.rd = reg_d_index;
+    current_trace.rs1 = reg_a_index;
+    break;
+  case number_6_opcode_sb:
+  case number_4_opcode_beq:
+    current_trace.rs1 = reg_a_index;
+    current_trace.rs2 = reg_b_index;
+    break;
+  case number_8_opcode_add:
+    current_trace.rd = reg_d_index;
+    current_trace.rs1 = reg_a_index;
+    current_trace.rs2 = reg_b_index;
+    break;
+  default:
+    break;
+  }
+
   switch (opcode) {
   case number_0_opcode_lui: { // lui
     state.gpr[reg_d_index] = immU(Instruction);
@@ -750,12 +969,8 @@ void Ref_cpu::RV32IM() {
   case number_2_opcode_jal: { // jal
     is_br = true;
     br_taken = true;
-    
-    current_trace.is_branch = true;
-    current_trace.branch_taken = true;
-    current_trace.target = state.pc + immJ(Instruction);
-    
     next_pc = state.pc + immJ(Instruction);
+    current_trace.target = next_pc;
     state.gpr[reg_d_index] = state.pc + 4;
     break;
   }
@@ -764,65 +979,58 @@ void Ref_cpu::RV32IM() {
     br_taken = true;
     bool bit_temp[32];
     next_pc = (reg_rdata1 + immI(Instruction)) & 0xFFFFFFFC;
-    
-    current_trace.is_branch = true;
-    current_trace.branch_taken = true;
     current_trace.target = next_pc;
-    
     state.gpr[reg_d_index] = state.pc + 4;
     break;
   }
   case number_4_opcode_beq: { // beq, bne, blt, bge, bltu, bgeu
     is_br = true;
-    current_trace.is_branch = true;
-    current_trace.target = state.pc + immB(Instruction);
-    
     switch (funct3) {
     case 0: { // beq
       if (reg_rdata1 == reg_rdata2) {
         br_taken = true;
-        current_trace.branch_taken = true;
         next_pc = (state.pc + immB(Instruction));
+        current_trace.target = next_pc;
       }
       break;
     }
     case 1: { // bne
       if (reg_rdata1 != reg_rdata2) {
         br_taken = true;
-        current_trace.branch_taken = true;
         next_pc = (state.pc + immB(Instruction));
+        current_trace.target = next_pc;
       }
       break;
     }
     case 4: { // blt
       if ((int32_t)reg_rdata1 < (int32_t)reg_rdata2) {
         br_taken = true;
-        current_trace.branch_taken = true;
         next_pc = (state.pc + immB(Instruction));
+        current_trace.target = next_pc;
       }
       break;
     }
     case 5: { // bge
       if ((int32_t)reg_rdata1 >= (int32_t)reg_rdata2) {
         br_taken = true;
-        current_trace.branch_taken = true;
         next_pc = (state.pc + immB(Instruction));
+        current_trace.target = next_pc;
       }
       break;
     }
     case 6: { // bltu
       if ((uint32_t)reg_rdata1 < (uint32_t)reg_rdata2) {
         br_taken = true;
-        current_trace.branch_taken = true;
         next_pc = (state.pc + immB(Instruction));
+        current_trace.target = next_pc;
       }
       break;
     }
     case 7: { // bgeu
       if ((uint32_t)reg_rdata1 >= (uint32_t)reg_rdata2) {
         br_taken = true;
-        current_trace.branch_taken = true;
         next_pc = (state.pc + immB(Instruction));
+        current_trace.target = next_pc;
       }
       break;
     }
@@ -832,20 +1040,36 @@ void Ref_cpu::RV32IM() {
   case number_5_opcode_lb: { // lb, lh, lw, lbu, lhu
     uint32_t v_addr = reg_rdata1 + immI(Instruction);
     uint32_t p_addr = v_addr;
-    
     current_trace.is_load = true;
     current_trace.mem_addr = v_addr;
-    
+
+    uint32_t size = funct3 & 0b11;
+    uint32_t access_size = (size == 0b00) ? 1 : ((size == 0b01) ? 2 : 4);
+    if ((size == 0b01 && (v_addr % 2 != 0)) ||
+        (size == 0b10 && (v_addr % 4 != 0))) {
+      std::cerr << "Misaligned Load! addr: 0x" << std::hex << v_addr
+                << std::endl;
+      exit(-1);
+    }
+
     if ((state.csr[csr_satp] & 0x80000000) && privilege != 3) {
       page_fault_load = !va2pa(p_addr, v_addr, 1);
     }
+    
+    if (p_addr < 0x80000000) {
+      is_io = true;
+      io_reg_idx = reg_d_index;
+      current_trace.is_trap = true;
+    }
 
     if (page_fault_load) {
+      current_trace.is_trap = true;
       exception(v_addr);
       return;
 
     } else {
-      uint32_t data = memory[p_addr >> 2];
+      check_mem_range_or_die("load", p_addr, access_size);
+      uint32_t data = load_word(p_addr);
       uint32_t offset = p_addr & 0b11;
       uint32_t size = funct3 & 0b11;
       uint32_t sign = 0, mask;
@@ -884,18 +1108,30 @@ void Ref_cpu::RV32IM() {
 
     uint32_t v_addr = reg_rdata1 + immS(Instruction);
     uint32_t p_addr = v_addr;
-    
     current_trace.is_store = true;
     current_trace.mem_addr = v_addr;
-    
+    uint32_t access_size = (funct3 == 0b00) ? 1 : ((funct3 == 0b01) ? 2 : 4);
+
+    if ((funct3 == 0b01 && (v_addr % 2 != 0)) ||
+        (funct3 == 0b10 && (v_addr % 4 != 0))) {
+      std::cerr << "Misaligned Store! addr: 0x" << std::hex << v_addr
+                << std::endl;
+      exit(-1);
+    }
+
     if ((state.csr[csr_satp] & 0x80000000) && privilege != 3) {
       page_fault_store = !va2pa(p_addr, v_addr, 2);
     }
 
     if (page_fault_store) {
+      current_trace.is_trap = true;
       exception(v_addr);
       return;
     } else {
+      if (p_addr < 0x80000000) {
+        current_trace.is_trap = true;
+      }
+      check_mem_range_or_die("store", p_addr, access_size);
 
       state.store = true;
       state.store_addr = p_addr;
@@ -916,48 +1152,100 @@ void Ref_cpu::RV32IM() {
     break;
   }
   case number_7_opcode_addi: { // addi, slti, sltiu, xori, ori, andi, slli,
-                               // srli, srai
+                               // srli, srai, and Zbb/Zbs Immediates
+    uint32_t imm = immI(Instruction);
+    uint32_t shamt = imm & 0x1F;
     switch (funct3) {
     case 0: { // addi
-      state.gpr[reg_d_index] = reg_rdata1 + immI(Instruction);
+      state.gpr[reg_d_index] = reg_rdata1 + imm;
       break;
     }
     case 2: { // slti
-      state.gpr[reg_d_index] =
-          (int32_t)reg_rdata1 < (int32_t)immI(Instruction) ? 1 : 0;
+      state.gpr[reg_d_index] = (int32_t)reg_rdata1 < (int32_t)imm ? 1 : 0;
       break;
     }
     case 3: { // sltiu
-      state.gpr[reg_d_index] =
-          (uint32_t)reg_rdata1 < (uint32_t)immI(Instruction) ? 1 : 0;
+      state.gpr[reg_d_index] = (uint32_t)reg_rdata1 < (uint32_t)imm ? 1 : 0;
       break;
     }
     case 4: { // xori
-      state.gpr[reg_d_index] = reg_rdata1 ^ immI(Instruction);
+      state.gpr[reg_d_index] = reg_rdata1 ^ imm;
       break;
     }
     case 6: { // ori
-      state.gpr[reg_d_index] = reg_rdata1 | immI(Instruction);
+      state.gpr[reg_d_index] = reg_rdata1 | imm;
       break;
     }
     case 7: { // andi
-      state.gpr[reg_d_index] = reg_rdata1 & immI(Instruction);
+      state.gpr[reg_d_index] = reg_rdata1 & imm;
       break;
     }
-    case 1: { // slli
-      state.gpr[reg_d_index] = reg_rdata1 << immI(Instruction);
+    case 1: {            // slli, bseti, bclri, binvi, clz, ctz, pcnt, sext
+      if (funct7 == 0) { // slli
+        state.gpr[reg_d_index] = reg_rdata1 << shamt;
+      } else if (funct7 == 0x30) { // Zbb Unary (clz, ctz, pcnt, sext)
+        // For OP-IMM-Unary, rs2 field (shamt) is the differentiator
+        // reg_b_index is extracted from bits 24:20 which IS the shamt field
+        // position So checking reg_b_index is correct.
+        uint32_t sub_op = reg_b_index;
+        if (sub_op == 0) { // clz
+          state.gpr[reg_d_index] =
+              (reg_rdata1 == 0) ? 32 : __builtin_clz(reg_rdata1);
+        } else if (sub_op == 1) { // ctz
+          state.gpr[reg_d_index] =
+              (reg_rdata1 == 0) ? 32 : __builtin_ctz(reg_rdata1);
+        } else if (sub_op == 2) { // pcnt
+          state.gpr[reg_d_index] = __builtin_popcount(reg_rdata1);
+        } else if (sub_op == 4) { // sext.b
+          int32_t byte_val = (int32_t)((int8_t)(reg_rdata1 & 0xFF));
+          state.gpr[reg_d_index] = (uint32_t)byte_val;
+        } else if (sub_op == 5) { // sext.h
+          int32_t half_val = (int32_t)((int16_t)(reg_rdata1 & 0xFFFF));
+          state.gpr[reg_d_index] = (uint32_t)half_val;
+        }
+      } else if (funct7 == 0x14) { // bseti (Zbs)
+        state.gpr[reg_d_index] = reg_rdata1 | (1u << shamt);
+      } else if (funct7 == 0x24) { // bclri (Zbs)
+        state.gpr[reg_d_index] = reg_rdata1 & ~(1u << shamt);
+      } else if (funct7 == 0x34) { // binvi (Zbs)
+        state.gpr[reg_d_index] = reg_rdata1 ^ (1u << shamt);
+      }
       break;
     }
-    case 5: { // srli, srai
-      switch (funct7) {
-      case 0: { // srli
-        state.gpr[reg_d_index] = (uint32_t)reg_rdata1 >> immI(Instruction);
-        break;
-      }
-      case 32: { // srai
-        state.gpr[reg_d_index] = (int32_t)reg_rdata1 >> immI(Instruction);
-        break;
-      }
+    case 5: {            // srli, srai, rori, bexti, rev8, orcb
+      if (funct7 == 0) { // srli
+        state.gpr[reg_d_index] = (uint32_t)reg_rdata1 >> shamt;
+      } else if (funct7 == 0x20) { // srai
+        state.gpr[reg_d_index] = (int32_t)reg_rdata1 >> shamt;
+      } else if (funct7 == 0x30) { // rori (Zbb)
+        state.gpr[reg_d_index] =
+            (reg_rdata1 >> shamt) | (reg_rdata1 << (32 - shamt));
+      } else if (funct7 == 0x24) { // bexti (Zbs)
+        state.gpr[reg_d_index] = (reg_rdata1 >> shamt) & 1;
+      } else if (funct7 == 0x34) { // rev8 (Zbb) - shamt must be 24?
+        // Spec says rev8 encoding is fixed.
+        // But checking sub_op (shamt/rs2) is valid.
+        // rev8: rs2=24 (11000).
+        if (reg_b_index == 24) {
+          uint32_t x = reg_rdata1;
+          state.gpr[reg_d_index] = ((x & 0xFF) << 24) | ((x & 0xFF00) << 8) |
+                                   ((x & 0xFF0000) >> 8) |
+                                   ((x & 0xFF000000) >> 24);
+        }
+      } else if (funct7 == 0x14) { // orcb (Zbb) - shamt must be 7?
+        if (reg_b_index == 7) {
+          uint32_t x = reg_rdata1;
+          uint32_t res = 0;
+          if (x & 0xFF)
+            res |= 0xFF;
+          if (x & 0xFF00)
+            res |= 0xFF00;
+          if (x & 0xFF0000)
+            res |= 0xFF0000;
+          if (x & 0xFF000000)
+            res |= 0xFF000000;
+          state.gpr[reg_d_index] = res;
+        }
       }
       break;
     }
@@ -1037,56 +1325,129 @@ void Ref_cpu::RV32IM() {
       }
     } else {
       switch (funct3) {
-      case 0: { // add, sub
-        switch (funct7) {
-        case 0: { // add
+      case 0: {            // add, sub
+        if (funct7 == 0) { // add
           state.gpr[reg_d_index] = reg_rdata1 + reg_rdata2;
-          break;
-        }
-        case 32: { // sub
+        } else if (funct7 == 0x20) { // sub
           state.gpr[reg_d_index] = reg_rdata1 - reg_rdata2;
-          break;
-        }
         }
         break;
       }
-      case 1: { // sll
-        state.gpr[reg_d_index] = reg_rdata1 << reg_rdata2;
-        break;
-      }
-      case 2: { // slt
-        state.gpr[reg_d_index] =
-            (int32_t)reg_rdata1 < (int32_t)reg_rdata2 ? 1 : 0;
-        break;
-      }
-      case 3: { // sltu
-        state.gpr[reg_d_index] =
-            (uint32_t)reg_rdata1 < (uint32_t)reg_rdata2 ? 1 : 0;
-        break;
-      }
-      case 4: { // xor
-        state.gpr[reg_d_index] = reg_rdata1 ^ reg_rdata2;
-        break;
-      }
-      case 5: { // srl, sra
-        switch (funct7) {
-        case 0: { // srl
-          state.gpr[reg_d_index] = (uint32_t)reg_rdata1 >> reg_rdata2;
-          break;
-        }
-        case 32: { // sra
-          state.gpr[reg_d_index] = (int32_t)reg_rdata1 >> reg_rdata2;
-          break;
-        }
+      case 1: { // sll, rol, bclr, bset, binv, clmul
+        uint32_t shift = reg_rdata2 & 0x1F;
+        if (funct7 == 0) { // sll
+          state.gpr[reg_d_index] = reg_rdata1 << shift;
+        } else if (funct7 == 0x30) { // rol (Zbb)
+          state.gpr[reg_d_index] =
+              (reg_rdata1 << shift) | (reg_rdata1 >> (32 - shift));
+        } else if (funct7 == 0x24) { // bclr (Zbs)
+          state.gpr[reg_d_index] = reg_rdata1 & ~(1u << shift);
+        } else if (funct7 == 0x14) { // bset (Zbs)
+          state.gpr[reg_d_index] = reg_rdata1 | (1u << shift);
+        } else if (funct7 == 0x34) { // binv (Zbs)
+          state.gpr[reg_d_index] = reg_rdata1 ^ (1u << shift);
+        } else if (funct7 == 0x05) { // clmul (Zbc)
+          uint32_t output = 0;
+          for (int i = 0; i < 32; i++) {
+            if ((reg_rdata2 >> i) & 1)
+              output ^= (reg_rdata1 << i);
+          }
+          state.gpr[reg_d_index] = output;
         }
         break;
       }
-      case 6: { // or
-        state.gpr[reg_d_index] = reg_rdata1 | reg_rdata2;
+      case 2: {            // slt, sh1add, clmulr
+        if (funct7 == 0) { // slt
+          state.gpr[reg_d_index] =
+              (int32_t)reg_rdata1 < (int32_t)reg_rdata2 ? 1 : 0;
+        } else if (funct7 == 0x10) { // sh1add (Zba)
+          state.gpr[reg_d_index] = reg_rdata2 + (reg_rdata1 << 1);
+        } else if (funct7 == 0x05) { // clmulr (Zbc)
+          uint32_t output = 0;
+          for (int i = 0; i < 32; i++) {
+            if ((reg_rdata2 >> i) & 1)
+              output ^= (reg_rdata1 >> (31 - i));
+          }
+          state.gpr[reg_d_index] = output;
+        }
         break;
       }
-      case 7: { // and
-        state.gpr[reg_d_index] = reg_rdata1 & reg_rdata2;
+      case 3: {            // sltu, clmulh
+        if (funct7 == 0) { // sltu
+          state.gpr[reg_d_index] =
+              (uint32_t)reg_rdata1 < (uint32_t)reg_rdata2 ? 1 : 0;
+        } else if (funct7 == 0x05) { // clmulh (Zbc)
+          uint32_t output = 0;
+          for (int i = 1; i < 32; i++) {
+            if ((reg_rdata2 >> i) & 1)
+              output ^= (reg_rdata1 >> (32 - i));
+          }
+          state.gpr[reg_d_index] = output;
+        }
+        break;
+      }
+      case 4: {            // xor, xnor, min, pack, sh2add
+        if (funct7 == 0) { // xor
+          state.gpr[reg_d_index] = reg_rdata1 ^ reg_rdata2;
+        } else if (funct7 == 0x20) { // xnor (Zbb)
+          state.gpr[reg_d_index] = ~(reg_rdata1 ^ reg_rdata2);
+        } else if (funct7 == 0x10) { // sh2add (Zba)
+          state.gpr[reg_d_index] = reg_rdata2 + (reg_rdata1 << 2);
+        } else if (funct7 == 0x05) { // min (Zbb)
+          state.gpr[reg_d_index] = ((int32_t)reg_rdata1 < (int32_t)reg_rdata2)
+                                       ? reg_rdata1
+                                       : reg_rdata2;
+        } else if (funct7 == 0x04) { // pack (Zbb)
+          state.gpr[reg_d_index] =
+              (reg_rdata1 & 0x0000FFFF) | (reg_rdata2 << 16);
+        }
+        break;
+      }
+      case 5: { // srl, sra, ror, bext, minu
+        uint32_t shift = reg_rdata2 & 0x1F;
+        if (funct7 == 0) { // srl
+          state.gpr[reg_d_index] = (uint32_t)reg_rdata1 >> shift;
+        } else if (funct7 == 0x20) { // sra
+          state.gpr[reg_d_index] = (int32_t)reg_rdata1 >> shift;
+        } else if (funct7 == 0x30) { // ror (Zbb)
+          state.gpr[reg_d_index] =
+              (reg_rdata1 >> shift) | (reg_rdata1 << (32 - shift));
+        } else if (funct7 == 0x24) { // bext (Zbs)
+          state.gpr[reg_d_index] = (reg_rdata1 >> shift) & 1;
+        } else if (funct7 == 0x05) { // minu (Zbb)
+          state.gpr[reg_d_index] = ((uint32_t)reg_rdata1 < (uint32_t)reg_rdata2)
+                                       ? reg_rdata1
+                                       : reg_rdata2;
+        }
+        break;
+      }
+      case 6: {            // or, orn, max, sh3add
+        if (funct7 == 0) { // or
+          state.gpr[reg_d_index] = reg_rdata1 | reg_rdata2;
+        } else if (funct7 == 0x20) { // orn (Zbb)
+          state.gpr[reg_d_index] = reg_rdata1 | (~reg_rdata2);
+        } else if (funct7 == 0x05) { // max (Zbb)
+          state.gpr[reg_d_index] = ((int32_t)reg_rdata1 > (int32_t)reg_rdata2)
+                                       ? reg_rdata1
+                                       : reg_rdata2;
+        } else if (funct7 == 0x10) { // sh3add (Zba)
+          state.gpr[reg_d_index] = reg_rdata2 + (reg_rdata1 << 3);
+        }
+        break;
+      }
+      case 7: {            // and, andn, maxu, packh
+        if (funct7 == 0) { // and
+          state.gpr[reg_d_index] = reg_rdata1 & reg_rdata2;
+        } else if (funct7 == 0x20) { // andn (Zbb)
+          state.gpr[reg_d_index] = reg_rdata1 & (~reg_rdata2);
+        } else if (funct7 == 0x05) { // maxu (Zbb)
+          state.gpr[reg_d_index] = ((uint32_t)reg_rdata1 > (uint32_t)reg_rdata2)
+                                       ? reg_rdata1
+                                       : reg_rdata2;
+        } else if (funct7 == 0x04) { // packh (Zbb)
+          state.gpr[reg_d_index] =
+              (reg_rdata1 & 0x000000FF) | ((reg_rdata2 & 0x000000FF) << 8);
+        }
         break;
       }
       }
@@ -1104,13 +1465,41 @@ void Ref_cpu::RV32IM() {
   state.pc = next_pc;
 }
 
-void Ref_cpu::store_data() {
+uint32_t Ref_cpu::load_word(uint32_t addr) const {
+  const uint32_t word_addr = addr & ~0x3u;
+  if (is_ram_range(word_addr, 4)) {
+    return memory[(word_addr - kRamBase) >> 2];
+  }
 
+  check_mem_range_or_die("word load", word_addr, 4);
+  auto it = io_words.find(word_addr);
+  return (it == io_words.end()) ? 0 : it->second;
+}
+
+void Ref_cpu::store_word(uint32_t addr, uint32_t data) {
+  const uint32_t word_addr = addr & ~0x3u;
+  if (is_ram_range(word_addr, 4)) {
+    memory[(word_addr - kRamBase) >> 2] = data;
+    return;
+  }
+
+  check_mem_range_or_die("word store", word_addr, 4);
+  io_words[word_addr] = data;
+}
+
+void Ref_cpu::store_data() {
   uint32_t p_addr = state.store_addr;
+  uint32_t write_size =
+      (state.store_strb == 0b1) ? 1 : ((state.store_strb == 0b11) ? 2 : 4);
+  check_mem_range_or_die("store_data", p_addr, write_size);
+  if (state.store) {
+    state.reserve_valid = false; // Any store (including successful SC)
+                                 // invalidates the reservation
+  }
   int offset = p_addr & 0x3;
   uint32_t wstrb = state.store_strb << offset;
   uint32_t wdata = state.store_data << (offset * 8);
-  uint32_t old_data = memory[p_addr / 4];
+  uint32_t old_data = load_word(p_addr);
   uint32_t mask = 0;
 
   if (wstrb & 0b1)
@@ -1121,39 +1510,36 @@ void Ref_cpu::store_data() {
     mask |= 0xFF0000;
   if (wstrb & 0b1000)
     mask |= 0xFF000000;
-  /*if ((number_funct3_unsigned == 1 && p_addr % 2 == 1) ||*/
-  /*    (number_funct3_unsigned == 2 && p_addr % 4 != 0)) {*/
-  /*  cout << "Store Memory Address Align Error!!!" << endl;*/
-  /*  cout << "funct3 code: " << dec << number_funct3_unsigned << endl;*/
-  /*  cout << "addr: " << hex << p_addr << endl;*/
-  /*  exit(-1);*/
-  /*}*/
 
-  memory[p_addr / 4] = (mask & wdata) | (~mask & old_data);
+  if (state.store) {
+    store_word(p_addr, (mask & wdata) | (~mask & old_data));
+  }
 
   if (p_addr == UART_BASE) {
     char temp;
     temp = wdata & 0x000000ff;
-    memory[0x10000000 / 4] = memory[0x10000000 / 4] & 0xffffff00;
+    store_word(0x10000000, load_word(0x10000000) & 0xffffff00);
     std::cout << temp;
   }
 
   if (p_addr == 0x10000001 && (state.store_data & 0x000000ff) == 7) {
-    memory[0xc201004 / 4] = 0xa;
-    memory[0x10000000 / 4] = memory[0x10000000 / 4] & 0xfff0ffff;
+    store_word(0xc201004, 0xa);
+    store_word(0x10000000, load_word(0x10000000) & 0xfff0ffff);
 
     state.csr[csr_mip] = state.csr[csr_mip] | (1 << 9);
     state.csr[csr_sip] = state.csr[csr_sip] | (1 << 9);
+    force_sync = true;
   }
 
   if (p_addr == 0x10000001 && (state.store_data & 0x000000ff) == 5) {
-    memory[0x10000000 / 4] = memory[0x10000000 / 4] & 0xfff0ffff | 0x00030000;
+    store_word(0x10000000, (load_word(0x10000000) & 0xfff0ffff) | 0x00030000);
   }
 
   if (p_addr == 0xc201004 && (state.store_data & 0x000000ff) == 0xa) {
-    memory[0xc201004 / 4] = 0x0;
+    store_word(0xc201004, 0x0);
     state.csr[csr_mip] = state.csr[csr_mip] & ~(1 << 9);
     state.csr[csr_sip] = state.csr[csr_sip] & ~(1 << 9);
+    force_sync = true;
   }
 }
 
@@ -1185,7 +1571,8 @@ bool Ref_cpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
   uint32_t pte1_addr = (ppn_root << 12) | (vpn1 << 2);
 
   // 直接读取，注意这里需要确保 memory 是按字寻址还是字节寻址
-  uint32_t pte1 = memory[pte1_addr >> 2];
+  check_mem_range_or_die("ptw-l1", pte1_addr, 4);
+  uint32_t pte1 = load_word(pte1_addr);
 
   // 3. 检查 PTE 有效性
   // !V 或者 (!R && W) 都是无效的
@@ -1240,7 +1627,8 @@ bool Ref_cpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
   uint32_t vpn0 = (v_addr >> 12) & 0x3FF;
   uint32_t pte2_addr = (ppn1 << 12) | (vpn0 << 2);
 
-  uint32_t pte2 = memory[pte2_addr >> 2];
+  check_mem_range_or_die("ptw-l2", pte2_addr, 4);
+  uint32_t pte2 = load_word(pte2_addr);
 
   // 重复有效性检查
   if (!(pte2 & PTE_V) || (!(pte2 & PTE_R) && (pte2 & PTE_W))) {

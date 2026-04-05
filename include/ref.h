@@ -76,8 +76,10 @@
 // --- 1. 定义四种运行模式 ---
 enum class SimMode {
   NORMAL,         // 0. Process instructions until completion
-  RESTORE,        // 1. Restore from checkpoint and run
-  TRACE           // 2. Trace-based simulation
+  GEN_BBV,        // 1. Generate BBV (compat with simpoint_sim exec path)
+  GEN_CHECKPOINT, // 2. Generate checkpoints from SimPoint points
+  RESTORE,        // 3. CKPT mode: restore from checkpoint and run
+  TRACE           // 4. Trace-based simulation
 };
 
 // --- 2. 配置结构体 ---
@@ -85,8 +87,17 @@ struct SimConfig {
   SimMode mode = SimMode::NORMAL;
   std::string image_file;
   uint32_t ram_size = PHYSICAL_MEMORY_LENGTH;
+  bool difftest = false;
 
-  // Mode: RESTORE
+  // Mode: GEN_BBV
+  std::string bbv_output_file;
+
+  // Mode: GEN_CHECKPOINT
+  std::string points_file;
+  std::string weights_file;
+  std::string checkpoint_dir;
+
+  // Mode: CKPT (--mode ckpt)
   std::string restore_file; // Checkpoint file path
   uint64_t max_insts = 0;   // Max instructions to run (0 = infinite)
 };
@@ -100,11 +111,15 @@ typedef struct CPU_state {
   uint32_t store_data;
   uint32_t store_strb;
   bool store;
+  bool reserve_valid;
+  uint32_t reserve_addr;
 } CPU_state;
 
 class Ref_cpu {
 public:
+  ~Ref_cpu();
   uint32_t *memory;
+  std::unordered_map<uint32_t, uint32_t> io_words;
   uint32_t ram_size;
   uint32_t Instruction;
   CPU_state state;
@@ -130,6 +145,20 @@ public:
 
   bool sim_end;
   uint64_t sim_time;
+  bool is_io;
+  int io_reg_idx;
+  bool force_sync;
+
+  const uint64_t INTERVAL_SIZE = 10000000;
+  uint64_t interval_inst_count = 0;
+
+  uint32_t current_bb_head_pc = 0;
+  uint32_t current_bb_len = 0;
+
+  std::unordered_map<uint32_t, uint32_t> global_pc_to_id;
+  uint32_t next_bb_id = 1;
+  std::vector<uint64_t> bbv_counts;
+  std::ofstream bbv_file;
 
   void init(uint32_t reset_pc, const char *image, uint32_t size);
   void exec(const SimConfig &config);
@@ -142,6 +171,12 @@ public:
   void FORCE_INLINE RV32CSR();
   void exception(uint32_t trap_val);
   void store_data();
+  uint32_t load_word(uint32_t addr) const;
+  void store_word(uint32_t addr, uint32_t data);
+  void bbv_commit();
+  void bbv_init_file(const char *filename);
+  void dump_bbv();
+  void save_checkpoint(const std::string &filename);
 
   void restore_checkpoint(const std::string &filename);
 

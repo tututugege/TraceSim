@@ -22,7 +22,7 @@ void TraceSim::run() {
             // Mode-specific termination
             if (mode == SimMode::RESTORE) {
                 if (TraceSimConfig::SAMPLE_INSTRUCTIONS > 0 && rel_retired >= TraceSimConfig::SAMPLE_INSTRUCTIONS) {
-                    std::cout << "RESTORE mode: Sample instructions reached (" << TraceSimConfig::SAMPLE_INSTRUCTIONS << "). Ending simulation." << std::endl;
+                    std::cout << "CKPT mode: Sample instructions reached (" << TraceSimConfig::SAMPLE_INSTRUCTIONS << "). Ending simulation." << std::endl;
                     break;
                 }
             } else {
@@ -160,7 +160,13 @@ void TraceSim::run() {
                     op.issue_cycle = total_cycles;
                     bool hit = dcache.access(op.inst.mem_addr, total_cycles);
                     uint32_t latency = TraceSimConfig::LDU_LATENCY;
-                    if (!hit) latency += TraceSimConfig::DCACHE_MISS_PENALTY;
+                    if (!hit) {
+                        bool llc_hit = llc.access(op.inst.mem_addr, total_cycles);
+                        latency += TraceSimConfig::LLC_HIT_LATENCY;
+                        if (!llc_hit) {
+                            latency += TraceSimConfig::MEMORY_MISS_PENALTY;
+                        }
+                    }
                     
                     op.execute_cycle = total_cycles + latency;
                     if (op.inst.rd != 0) reg_ready_time[op.inst.rd] = op.execute_cycle;
@@ -194,14 +200,17 @@ void TraceSim::run() {
             if (rob_count >= rob_size) break;
             
             OpEntry& op = fetch_queue.front();
+            // Trap/MMIO/exception uop must serialize: wait until ROB drains.
+            if (op.inst.is_trap && rob_count > 0) break;
             
             bool iq_full = false;
-            if (op.fu_type == FU_Type::ALU && alu_iq.size() >= alu_iq_size) iq_full = true;
-            else if (op.fu_type == FU_Type::BRU && bru_iq.size() >= bru_iq_size) iq_full = true;
-            else if (op.fu_type == FU_Type::LSU) {
-                if (op.inst.is_load && ldu_iq.size() >= ldu_iq_size) iq_full = true;
-                else if (op.inst.is_store && (sta_iq.size() >= sta_iq_size || std_iq.size() >= std_iq_size)) iq_full = true;
-            }
+                if (op.fu_type == FU_Type::ALU && alu_iq.size() >= alu_iq_size) iq_full = true;
+                else if (op.fu_type == FU_Type::BRU && bru_iq.size() >= bru_iq_size) iq_full = true;
+                else if (op.fu_type == FU_Type::LSU) {
+                    if (op.inst.is_load && ldu_iq.size() >= ldu_iq_size) iq_full = true;
+                    else if (op.inst.is_store && (sta_iq.size() >= sta_iq_size || std_iq.size() >= std_iq_size)) iq_full = true;
+                    else if (!op.inst.is_load && !op.inst.is_store && alu_iq.size() >= alu_iq_size) iq_full = true;
+                }
             
             if (iq_full) break;
 
@@ -218,15 +227,25 @@ void TraceSim::run() {
             rob_count++;
             fetch_queue.pop_front();
             
-            if (op.fu_type == FU_Type::ALU) alu_iq.push_back(rob_idx);
-            else if (op.fu_type == FU_Type::BRU) bru_iq.push_back(rob_idx);
-            else if (op.fu_type == FU_Type::LSU) {
-                if (op.inst.is_load) ldu_iq.push_back(rob_idx);
-                
-                if (op.inst.is_store) {
+            if (op.inst.is_trap) {
+                rob[rob_idx].fu_type = FU_Type::ALU;
+                alu_iq.push_back(rob_idx);
+            } else if (op.fu_type == FU_Type::ALU) {
+                alu_iq.push_back(rob_idx);
+            } else if (op.fu_type == FU_Type::BRU) {
+                bru_iq.push_back(rob_idx);
+            } else if (op.fu_type == FU_Type::LSU) {
+                if (op.inst.is_load) {
+                    ldu_iq.push_back(rob_idx);
+                } else if (op.inst.is_store) {
                     sta_iq.push_back(rob_idx);
                     std_iq.push_back(rob_idx);
                     store_indices.push_back(rob_idx);
+                } else {
+                    // Trap-like or side-effect instructions can keep LSU opcode
+                    // but not be an actual memory op; execute as ALU to avoid deadlock.
+                    rob[rob_idx].fu_type = FU_Type::ALU;
+                    alu_iq.push_back(rob_idx);
                 }
             }
         }
@@ -252,19 +271,35 @@ void TraceSim::run() {
                     }
                 }
 
-                // Check Cache Line boundary
-                uint32_t inst_line = inst.pc & ~(icache.line_size - 1);
-                if (first_in_group) {
-                    current_line_addr = inst_line;
-                    // I-Cache simulation (only once per group/line)
+                // Check Cache Line boundary + I-Cache behavior.
+                if (TraceSimConfig::IGNORE_FETCH_BUBBLES) {
                     if (!icache.access(inst.pc, total_cycles)) {
-                        fetch_stall_until = total_cycles + TraceSimConfig::ICACHE_MISS_PENALTY;
+                        bool llc_hit = llc.access(inst.pc, total_cycles);
+                        uint32_t miss_penalty = TraceSimConfig::LLC_HIT_LATENCY;
+                        if (!llc_hit) {
+                            miss_penalty += TraceSimConfig::MEMORY_MISS_PENALTY;
+                        }
+                        fetch_stall_until = total_cycles + miss_penalty;
                         if (pre_fetch_buffer.empty()) pre_fetch_buffer.push_back(inst);
                         break;
                     }
-                    first_in_group = false;
                 } else {
-                    if (inst_line != current_line_addr) {
+                    uint32_t inst_line = inst.pc & ~(icache.line_size - 1);
+                    if (first_in_group) {
+                        current_line_addr = inst_line;
+                        // I-Cache simulation (only once per group/line)
+                        if (!icache.access(inst.pc, total_cycles)) {
+                            bool llc_hit = llc.access(inst.pc, total_cycles);
+                            uint32_t miss_penalty = TraceSimConfig::LLC_HIT_LATENCY;
+                            if (!llc_hit) {
+                                miss_penalty += TraceSimConfig::MEMORY_MISS_PENALTY;
+                            }
+                            fetch_stall_until = total_cycles + miss_penalty;
+                            if (pre_fetch_buffer.empty()) pre_fetch_buffer.push_back(inst);
+                            break;
+                        }
+                        first_in_group = false;
+                    } else if (inst_line != current_line_addr) {
                         // Boundary crossed - defer this instruction to next cycle
                         if (pre_fetch_buffer.empty()) pre_fetch_buffer.push_back(inst);
                         break;
@@ -282,16 +317,21 @@ void TraceSim::run() {
                 op.fu_type = get_fu_type(inst.opcode);
                 
                 bool stop_fetch = false;
+                if (inst.is_trap) {
+                    stop_fetch = true;
+                }
                 if (inst.is_branch) {
                     stats.total_branches++;
                     bool pred = bp->predict(inst.pc, inst.branch_taken);
                     bp->update(inst.pc, inst.branch_taken);
                     if (pred != inst.branch_taken) {
                         fetch_stall_until = total_cycles + TraceSimConfig::BRANCH_MISPREDICT_PENALTY;
-                        stop_fetch = true;
+                        if (!TraceSimConfig::IGNORE_FETCH_BUBBLES) {
+                            stop_fetch = true;
+                        }
                     } else {
                         stats.correct_branches++;
-                        if (inst.branch_taken) {
+                        if (inst.branch_taken && !TraceSimConfig::IGNORE_FETCH_BUBBLES) {
                             stop_fetch = true;
                         }
                     }
@@ -299,7 +339,8 @@ void TraceSim::run() {
 
                 // If the instruction is a jump (JAL/JALR), always stop fetching this cycle
                 uint32_t opcode = inst.opcode;
-                if (opcode == 0b1101111 || opcode == 0b1100111) {
+                if (!TraceSimConfig::IGNORE_FETCH_BUBBLES &&
+                    (opcode == 0b1101111 || opcode == 0b1100111)) {
                     stop_fetch = true;
                 }
 
@@ -314,4 +355,3 @@ void TraceSim::run() {
 
     print_stats();
 }
-

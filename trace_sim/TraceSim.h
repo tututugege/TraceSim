@@ -35,6 +35,7 @@ public:
     // Cache Models
     Cache icache;
     Cache dcache;
+    Cache llc;
 
     // Registers readiness time
     std::vector<uint64_t> reg_ready_time;
@@ -91,7 +92,8 @@ public:
           bru_iq_size(bru_iq_s),
           max_instructions(max_insts),
           icache(TraceSimConfig::ICACHE_SIZE, TraceSimConfig::ICACHE_ASSOC, TraceSimConfig::ICACHE_LINE_SIZE), 
-          dcache(TraceSimConfig::DCACHE_SIZE, TraceSimConfig::DCACHE_ASSOC, TraceSimConfig::DCACHE_LINE_SIZE) {
+          dcache(TraceSimConfig::DCACHE_SIZE, TraceSimConfig::DCACHE_ASSOC, TraceSimConfig::DCACHE_LINE_SIZE),
+          llc(TraceSimConfig::LLC_SIZE, TraceSimConfig::LLC_ASSOC, TraceSimConfig::LLC_LINE_SIZE) {
         reg_ready_time.resize(32, 0);
         rob.resize(rob_size);
 
@@ -120,6 +122,8 @@ public:
         uint64_t icache_hit = 0;
         uint64_t dcache_access = 0;
         uint64_t dcache_hit = 0;
+        uint64_t llc_access = 0;
+        uint64_t llc_hit = 0;
     } cache_baselines;
 
     void reset_stats() {
@@ -130,6 +134,8 @@ public:
         cache_baselines.icache_hit = icache.hit_count;
         cache_baselines.dcache_access = dcache.access_count;
         cache_baselines.dcache_hit = dcache.hit_count;
+        cache_baselines.llc_access = llc.access_count;
+        cache_baselines.llc_hit = llc.hit_count;
         
         stats = {0, 0, 0, 0}; // These are fine to reset as they are additive only
     }
@@ -152,6 +158,8 @@ public:
         uint64_t rel_icache_hit = icache.hit_count - cache_baselines.icache_hit;
         uint64_t rel_dcache_access = dcache.access_count - cache_baselines.dcache_access;
         uint64_t rel_dcache_hit = dcache.hit_count - cache_baselines.dcache_hit;
+        uint64_t rel_llc_access = llc.access_count - cache_baselines.llc_access;
+        uint64_t rel_llc_hit = llc.hit_count - cache_baselines.llc_hit;
 
         std::cout << "\n--- Phase Simulation Statistics ---" << std::endl;
         std::cout << "Total Instructions: " << rel_inst << std::endl;
@@ -183,10 +191,15 @@ public:
         std::cout << "D-Cache: " << rel_dcache_access << " accesses, Hit Rate: " 
                   << std::fixed << std::setprecision(2) << dc_hit_rate << "%" 
                   << " (MPKI: " << (double)dcache_misses / inst_kilo << ")" << std::endl;
+
+        uint64_t llc_misses = rel_llc_access - rel_llc_hit;
+        double llc_hit_rate = rel_llc_access > 0 ? (double)rel_llc_hit * 100.0 / rel_llc_access : 0;
+        std::cout << "LLC(shared): " << rel_llc_access << " accesses, Hit Rate: "
+                  << std::fixed << std::setprecision(2) << llc_hit_rate << "%"
+                  << " (MPKI: " << (double)llc_misses / inst_kilo << ")" << std::endl;
         std::cout << "-----------------------------\n" << std::endl;
     }
 
     void run();
 };
-
 
