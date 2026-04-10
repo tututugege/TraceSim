@@ -100,6 +100,9 @@ struct SimConfig {
   // Mode: CKPT (--mode ckpt)
   std::string restore_file; // Checkpoint file path
   uint64_t max_insts = 0;   // Max instructions to run (0 = infinite)
+
+  // Trace profiler controls
+  bool enable_dependent_load_profiling = true;
 };
 
 typedef struct CPU_state {

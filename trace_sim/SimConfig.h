@@ -26,7 +26,7 @@ constexpr uint32_t BRU_COUNT = 4;
 
 // Execution Latencies (cycles)
 constexpr uint32_t ALU_LATENCY = 1;
-constexpr uint32_t LDU_LATENCY = 3;
+constexpr uint32_t LDU_LATENCY = 4;
 constexpr uint32_t STA_LATENCY = 1;
 constexpr uint32_t STD_LATENCY = 1;
 constexpr uint32_t BRU_LATENCY = 1;
@@ -39,9 +39,9 @@ constexpr uint32_t LSU_MEM_LATENCY = 1; // Cache access latency (hit)
 // Penalties
 constexpr uint32_t BRANCH_MISPREDICT_PENALTY = 1;
 constexpr uint32_t LLC_HIT_LATENCY =
-    1; // Additional latency on L1 miss if LLC hits
+    12; // Additional latency on L1 miss if LLC hits
 constexpr uint32_t MEMORY_MISS_PENALTY =
-    1; // Additional latency when LLC misses
+    120; // Additional latency when LLC misses
 
 // I-Cache Parameters
 constexpr uint32_t ICACHE_SIZE = 16384; // 16 KB
@@ -59,12 +59,22 @@ constexpr uint32_t LLC_ASSOC = 16;
 constexpr uint32_t LLC_LINE_SIZE = 64;
 
 // Advanced Features
+enum class MemDepModel {
+  CONSERVATIVE_STA_VISIBLE, // Stall on any older store with unknown address.
+  ORACLE_STLF               // Oracle alias check; stall only on true alias and
+                            // wait for the aliased store's STD.
+};
+constexpr MemDepModel MEM_DEP_MODEL = MemDepModel::ORACLE_STLF;
 constexpr bool ENABLE_STLF = true; // Enable Store-to-Load Forwarding
-constexpr bool ENABLE_MEM_DISAMBIGUATION =
-    true; // Enable memory disambiguation stalls
 // Extreme upper-bound mode: remove fetch bubbles from cache-line boundary and
 // control-flow stops.
 constexpr bool IGNORE_FETCH_BUBBLES = true;
+
+// Dependent-load profiling
+constexpr bool ENABLE_DEPENDENT_LOAD_PROFILING = true;
+constexpr uint32_t DEPENDENT_LOAD_TOP_N = 50;
+constexpr uint32_t LONG_LATENCY_THRESHOLD = 50;
+constexpr bool DEPENDENT_LOAD_OUTPUT_CSV = false;
 
 // SimPoint / Checkpoint Parameters
 constexpr uint64_t WARMUP_INSTRUCTIONS = 100000000; // 100M

@@ -31,6 +31,10 @@ int main(int argc, char *argv[]) {
       config.restore_file = argv[++i];
     else if (arg == "--max-insts" && i + 1 < argc)
       config.max_insts = std::stoull(argv[++i]);
+    else if (arg == "--enable-dependent-load-profiling")
+      config.enable_dependent_load_profiling = true;
+    else if (arg == "--disable-dependent-load-profiling")
+      config.enable_dependent_load_profiling = false;
     else if (!arg.empty() && arg[0] != '-') {
       positional_input = arg;
     }
@@ -64,7 +68,8 @@ int main(int argc, char *argv[]) {
                        TraceSimConfig::STA_IQ_SIZE,
                        TraceSimConfig::STD_IQ_SIZE,
                        TraceSimConfig::BRU_IQ_SIZE,
-                       config.max_insts);
+                       config.max_insts,
+                       config.enable_dependent_load_profiling);
     trace_sim.run();
   } else {
     ref_cpu.exec(config);

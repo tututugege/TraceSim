@@ -26,4 +26,12 @@ struct OpEntry {
     bool std_done = false;
     uint64_t sta_cycle;
     uint64_t std_cycle;
+
+    // Dependent-load profiling metadata
+    bool load_classified = false;
+    bool is_dependent_load = false;
+    bool base_writer_valid = false;
+    bool base_writer_is_load = false;
+    uint64_t base_writer_entry_id = 0;
+    uint32_t base_writer_pc = 0;
 };

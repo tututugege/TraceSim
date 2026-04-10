@@ -7,6 +7,9 @@ void TraceSim::run() {
               << ", ALU_IQ=" << alu_iq_size << ", LDU_IQ=" << ldu_iq_size 
               << ", STA_IQ=" << sta_iq_size << ", STD_IQ=" << std_iq_size 
               << ", BRU_IQ=" << bru_iq_size << std::endl;
+    std::cout << "Dependent-load profiling: "
+              << (enable_dependent_load_profiling ? "enabled" : "disabled")
+              << std::endl;
 
     while (!ref_cpu.sim_end || rob_count > 0 || !fetch_queue.empty()) {
         if (in_warmup) {
@@ -38,6 +41,13 @@ void TraceSim::run() {
         for (uint32_t i = 0; i < width && rob_count > 0; ++i) {
             OpEntry &head_op = rob[rob_head];
             if (head_op.executed && head_op.execute_cycle <= total_cycles) {
+                if (enable_dependent_load_profiling && head_op.inst.rd != 0) {
+                    RegWriterInfo &dst_writer = reg_last_committed_writer[head_op.inst.rd];
+                    dst_writer.valid = true;
+                    dst_writer.entry_id = head_op.entry_id;
+                    dst_writer.is_load = head_op.inst.is_load;
+                    dst_writer.pc = head_op.inst.pc;
+                }
                 if (head_op.inst.is_store) {
                     if (!store_indices.empty()) {
                         store_indices.pop_front();
@@ -122,48 +132,72 @@ void TraceSim::run() {
             uint32_t rob_idx = *it;
             OpEntry &op = rob[rob_idx];
             if (reg_ready_time[op.inst.rs1] <= total_cycles) {
+                if (enable_dependent_load_profiling && !op.load_classified) {
+                    op.is_dependent_load = op.base_writer_valid && op.base_writer_is_load;
+                    op.load_classified = true;
+                }
                 bool stall = false;
-                // Memory Disambiguation & STLF: Scan active stores
+                OpEntry *stlf_src = nullptr;
                 for (uint32_t st_idx : store_indices) {
                     OpEntry &st_op = rob[st_idx];
                     if (st_op.entry_id >= op.entry_id) break; // Reached current load or younger store
-                    if (!st_op.sta_done) {
-                        if (TraceSimConfig::ENABLE_MEM_DISAMBIGUATION) {
+
+                    if (TraceSimConfig::MEM_DEP_MODEL == TraceSimConfig::MemDepModel::CONSERVATIVE_STA_VISIBLE) {
+                        // Conservative model: unknown older store address blocks load.
+                        if (!st_op.sta_done) {
                             stall = true;
                             stats.mem_dep_stalls++;
                             break;
                         }
-                    } else if (st_op.inst.mem_addr == op.inst.mem_addr) {
-                        if (TraceSimConfig::ENABLE_STLF) {
-                            if (st_op.std_done && total_cycles >= st_op.std_cycle) {
-                                // STLF Hit
-                                stats.stlf_hits++;
-                                ldu_issued++;
-                                op.issue_cycle = total_cycles;
-                                op.execute_cycle = total_cycles + 1;
-                                if (op.inst.rd != 0) reg_ready_time[op.inst.rd] = op.execute_cycle;
-                                op.executed = true;
-                                it = ldu_iq.erase(it);
-                                goto next_ldu;
-                            } else {
-                                stall = true; // Wait for store data
-                            }
-                        } else {
-                            stall = true;
+                        if (st_op.inst.mem_addr == op.inst.mem_addr) {
+                            stlf_src = &st_op; // Keep youngest matching older store seen so far.
                         }
-                        break;
+                    } else {
+                        // Oracle STLF model: address alias is known exactly even before STA.
+                        if (st_op.inst.mem_addr == op.inst.mem_addr) {
+                            stlf_src = &st_op; // Keep youngest matching older store.
+                        }
                     }
+                }
+
+                if (!stall && stlf_src != nullptr) {
+                    if (TraceSimConfig::ENABLE_STLF && stlf_src->std_done && total_cycles >= stlf_src->std_cycle) {
+                        // STLF Hit
+                        stats.stlf_hits++;
+                        ldu_issued++;
+                        op.issue_cycle = total_cycles;
+                        op.execute_cycle = total_cycles + 1;
+                        if (op.inst.rd != 0) reg_ready_time[op.inst.rd] = op.execute_cycle;
+                        op.executed = true;
+                        if (enable_dependent_load_profiling) {
+                            record_load_event(
+                                op,
+                                is_dependent_load(op),
+                                is_stlf_hit(true),
+                                /*latency=*/1,
+                                /*l1_hit=*/false,
+                                /*l2_hit=*/false,
+                                /*dram_miss=*/false);
+                        }
+                        it = ldu_iq.erase(it);
+                        goto next_ldu;
+                    }
+                    stall = true; // True-alias store exists but data not ready (or STLF disabled).
+                    stats.mem_dep_stalls++;
                 }
 
                 if (!stall) {
                     ldu_issued++;
                     op.issue_cycle = total_cycles;
-                    bool hit = dcache.access(op.inst.mem_addr, total_cycles);
+                    bool l1_hit = dcache.access(op.inst.mem_addr, total_cycles);
+                    bool l2_hit = false;
+                    bool dram_miss = false;
                     uint32_t latency = TraceSimConfig::LDU_LATENCY;
-                    if (!hit) {
-                        bool llc_hit = llc.access(op.inst.mem_addr, total_cycles);
+                    if (!l1_hit) {
+                        l2_hit = llc.access(op.inst.mem_addr, total_cycles);
                         latency += TraceSimConfig::LLC_HIT_LATENCY;
-                        if (!llc_hit) {
+                        if (!l2_hit) {
+                            dram_miss = true;
                             latency += TraceSimConfig::MEMORY_MISS_PENALTY;
                         }
                     }
@@ -171,6 +205,16 @@ void TraceSim::run() {
                     op.execute_cycle = total_cycles + latency;
                     if (op.inst.rd != 0) reg_ready_time[op.inst.rd] = op.execute_cycle;
                     op.executed = true;
+                    if (enable_dependent_load_profiling) {
+                        record_load_event(
+                            op,
+                            is_dependent_load(op),
+                            is_stlf_hit(false),
+                            latency,
+                            l1_hit,
+                            l2_hit,
+                            dram_miss);
+                    }
                     it = ldu_iq.erase(it);
                     continue;
                 }
@@ -222,10 +266,37 @@ void TraceSim::run() {
             rob[rob_idx].sta_done = false;
             rob[rob_idx].std_done = false;
             rob[rob_idx].executed = false;
+            rob[rob_idx].load_classified = false;
+            rob[rob_idx].is_dependent_load = false;
+            rob[rob_idx].base_writer_valid = false;
+            rob[rob_idx].base_writer_is_load = false;
+            rob[rob_idx].base_writer_entry_id = 0;
+            rob[rob_idx].base_writer_pc = 0;
+
+            if (enable_dependent_load_profiling && op.inst.is_load) {
+                const uint32_t base_reg = op.inst.rs1;
+                if (base_reg != 0) {
+                    const RegWriterInfo &writer = reg_last_writer[base_reg];
+                    rob[rob_idx].base_writer_valid = writer.valid;
+                    rob[rob_idx].base_writer_is_load = writer.is_load;
+                    rob[rob_idx].base_writer_entry_id = writer.entry_id;
+                    rob[rob_idx].base_writer_pc = writer.pc;
+                }
+            }
             
             rob_tail = (rob_tail + 1) % rob_size;
             rob_count++;
             fetch_queue.pop_front();
+
+            // Rename-style producer tracking: snapshot the latest dynamic writer
+            // so younger ops can classify dependencies without changing pipeline behavior.
+            if (enable_dependent_load_profiling && op.inst.rd != 0) {
+                RegWriterInfo &dst_writer = reg_last_writer[op.inst.rd];
+                dst_writer.valid = true;
+                dst_writer.entry_id = op.entry_id;
+                dst_writer.is_load = op.inst.is_load;
+                dst_writer.pc = op.inst.pc;
+            }
             
             if (op.inst.is_trap) {
                 rob[rob_idx].fu_type = FU_Type::ALU;
