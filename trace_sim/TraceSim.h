@@ -14,11 +14,13 @@
 #include "mem/Cache.h"
 #include "frontend/BranchPredictor.h"
 #include "frontend/FrontendTypes.h"
+#include "Profiler.h"
 #include "OpEntry.h"
 
 // Forward declarations for modular subsystems
 class Frontend;
 class LoadStoreUnit;
+class Profiler;
 
 class TraceSim {
 public:
@@ -27,20 +29,23 @@ public:
 
     Ref_cpu &ref_cpu;
     std::unique_ptr<BranchPredictor> bp;
+    std::unique_ptr<Profiler> profiler;
+
     uint64_t total_cycles = 0;
     uint64_t instructions_retired = 0;
     uint64_t next_entry_id = 0;
     
     // Configuration
     uint32_t fetch_bandwidth;
-    uint32_t width; 
+    uint32_t dispatch_width;
+    uint32_t commit_width;
     uint32_t rob_size;
     uint32_t alu_iq_size;
     uint32_t ldu_iq_size;
     uint32_t sta_iq_size;
     uint32_t std_iq_size;
     uint32_t bru_iq_size;
-    uint32_t inst_buffer_size = 64;
+    uint32_t inst_buffer_size;
     uint64_t max_instructions;
 
     // Registers readiness time
@@ -87,14 +92,6 @@ public:
     bool in_warmup = false;
     bool enable_dependent_load_profiling;
 
-    // Statistics structure
-    struct Stats {
-        uint64_t total_branches = 0;
-        uint64_t correct_branches = 0;
-        uint64_t stlf_hits = 0;
-        uint64_t mem_dep_stalls = 0;
-    } stats;
-
     struct RegWriterInfo {
         bool valid = false;
         uint64_t entry_id = 0;
@@ -108,7 +105,10 @@ public:
     std::unique_ptr<Frontend> frontend;
     std::unique_ptr<LoadStoreUnit> lsu;
 
-    TraceSim(Ref_cpu &cpu, SimMode m, uint32_t w = TraceSimConfig::FETCH_WIDTH, 
+    TraceSim(Ref_cpu &cpu, SimMode m, 
+             uint32_t fetch_w = TraceSimConfig::FETCH_WIDTH, 
+             uint32_t dispatch_w = TraceSimConfig::DISPATCH_WIDTH,
+             uint32_t commit_w = TraceSimConfig::COMMIT_WIDTH,
              uint32_t rob_s = TraceSimConfig::ROB_SIZE, 
              uint32_t alu_iq_size = TraceSimConfig::ALU_IQ_SIZE,
              uint32_t ldu_iq_size = TraceSimConfig::LDU_IQ_SIZE,
@@ -134,7 +134,7 @@ public:
     // Core Pipeline Stages
     void commit_stage();
     void issue_stage();
-    void dispatch_stage();
+    BackendStallReason dispatch_stage();
     void decode_stage();
     void advance_cycle();
 

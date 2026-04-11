@@ -62,6 +62,8 @@ int main(int argc, char *argv[]) {
     TraceSim trace_sim(ref_cpu, 
                        config.mode,
                        TraceSimConfig::FETCH_WIDTH, 
+                       TraceSimConfig::DISPATCH_WIDTH,
+                       TraceSimConfig::COMMIT_WIDTH,
                        TraceSimConfig::ROB_SIZE, 
                        TraceSimConfig::ALU_IQ_SIZE,
                        TraceSimConfig::LDU_IQ_SIZE,

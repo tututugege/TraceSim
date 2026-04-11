@@ -71,6 +71,7 @@ void Frontend::fetch_stage() {
             } else if (inst_line != current_line_addr) {
                 // Boundary crossed - defer this instruction to next cycle.
                 next_frontend_bound_hint = BoundReason::LINE_BOUNDARY;
+                sim.set_fetch_stall(sim.total_cycles + 1, FetchStallReason::LINE_BOUNDARY);
                 if (sim.pre_fetch_buffer.empty()) sim.pre_fetch_buffer.push_back(inst);
                 break;
             }
@@ -92,7 +93,7 @@ void Frontend::fetch_stage() {
                 stop_fetch = true;
             }
             if (inst.is_branch) {
-                sim.stats.total_branches++;
+                sim.profiler->inc_total_branches();
                 bool pred = sim.bp->predict(inst.pc, inst.branch_taken);
                 sim.bp->update(inst.pc, inst.branch_taken);
                 if (pred != inst.branch_taken) {
@@ -101,11 +102,12 @@ void Frontend::fetch_stage() {
                         FetchStallReason::BRANCH_MISPREDICT);
                     stop_fetch = true;
                 } else {
-                    sim.stats.correct_branches++;
+                    sim.profiler->inc_correct_branches();
                     if (inst.branch_taken) {
-                        if (TraceSimConfig::BRANCH_MISPREDICT_PENALTY > 0) {
+                        // 正确预测的跳转，仅需 1 周期重定向延迟 (FETCH_REDIRECT_LATENCY)
+                        if (TraceSimConfig::FETCH_REDIRECT_LATENCY > 0) {
                             sim.set_fetch_stall(
-                                sim.total_cycles + TraceSimConfig::BRANCH_MISPREDICT_PENALTY,
+                                sim.total_cycles + TraceSimConfig::FETCH_REDIRECT_LATENCY,
                                 FetchStallReason::FETCH_REDIRECT);
                         }
                         stop_fetch = true;
@@ -117,9 +119,9 @@ void Frontend::fetch_stage() {
             // Jumps always redirect the fetch stream.
             uint32_t opcode = inst.opcode;
             if (opcode == 0b1101111 || opcode == 0b1100111) {
-                if (TraceSimConfig::BRANCH_MISPREDICT_PENALTY > 0) {
+                if (TraceSimConfig::FETCH_REDIRECT_LATENCY > 0) {
                     sim.set_fetch_stall(
-                        sim.total_cycles + TraceSimConfig::BRANCH_MISPREDICT_PENALTY,
+                        sim.total_cycles + TraceSimConfig::FETCH_REDIRECT_LATENCY,
                         FetchStallReason::FETCH_REDIRECT);
                 }
                 stop_fetch = true;

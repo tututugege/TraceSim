@@ -1,22 +1,28 @@
 #include "TraceSim.h"
 #include "frontend/Frontend.h"
 #include "mem/LoadStoreUnit.h"
+#include "Profiler.h"
 #include <iomanip>
 
-TraceSim::TraceSim(Ref_cpu &cpu, SimMode m, uint32_t w, 
+TraceSim::TraceSim(Ref_cpu &cpu, SimMode m, 
+                   uint32_t fetch_w, uint32_t dispatch_w, uint32_t commit_w,
                    uint32_t rob_s, uint32_t alu_iq_s, uint32_t ldu_iq_s,
                    uint32_t sta_iq_size, uint32_t std_iq_size, uint32_t bru_iq_size,
                    uint64_t max_insts, bool enable_dep_load_profile)
-    : ref_cpu(cpu), mode(m), fetch_bandwidth(w), width(w), rob_size(rob_s), 
+    : ref_cpu(cpu), mode(m), fetch_bandwidth(fetch_w), 
+      dispatch_width(dispatch_w), commit_width(commit_w),
+      rob_size(rob_s), 
       alu_iq_size(alu_iq_s), ldu_iq_size(ldu_iq_s), sta_iq_size(sta_iq_size), std_iq_size(std_iq_size),
       bru_iq_size(bru_iq_size),
+      inst_buffer_size(TraceSimConfig::INST_BUFFER_SIZE),
       max_instructions(max_insts),
       enable_dependent_load_profiling(enable_dep_load_profile),
       icache(TraceSimConfig::ICACHE_SIZE, TraceSimConfig::ICACHE_ASSOC, TraceSimConfig::ICACHE_LINE_SIZE), 
       dcache(TraceSimConfig::DCACHE_SIZE, TraceSimConfig::DCACHE_ASSOC, TraceSimConfig::DCACHE_LINE_SIZE),
       llc(TraceSimConfig::LLC_SIZE, TraceSimConfig::LLC_ASSOC, TraceSimConfig::LLC_LINE_SIZE),
       frontend(std::make_unique<Frontend>(*this)),
-      lsu(std::make_unique<LoadStoreUnit>(*this)) {
+      lsu(std::make_unique<LoadStoreUnit>(*this)),
+      profiler(std::make_unique<Profiler>()) {
     
     reg_ready_time.resize(32, 0);
     reg_last_writer.resize(32);
@@ -48,12 +54,16 @@ void TraceSim::reset_stats() {
     cache_baselines.dcache_hit = dcache.hit_count;
     cache_baselines.llc_access = llc.access_count;
     cache_baselines.llc_hit = llc.hit_count;
-    stats = {0, 0, 0, 0};
+    
+    profiler->reset();
 }
 
 void TraceSim::run() {
     std::cout << "Starting Out-of-Order Trace-based Simulation..." << std::endl;
-    std::cout << "Config: Width=" << fetch_bandwidth << ", ROB=" << rob_size 
+    std::cout << "Config: FetchWidth=" << fetch_bandwidth 
+              << ", DispatchWidth=" << dispatch_width 
+              << ", CommitWidth=" << commit_width << std::endl;
+    std::cout << "Resources: ROB=" << rob_size 
               << ", ALU_IQ=" << alu_iq_size << ", LDU_IQ=" << ldu_iq_size 
               << ", STA_IQ=" << sta_iq_size << ", STD_IQ=" << std_iq_size 
               << ", BRU_IQ=" << bru_iq_size << std::endl;
@@ -62,13 +72,33 @@ void TraceSim::run() {
         process_cache_returns();
         advance_cycle();
 
+        uint64_t insts_before = instructions_retired;
         commit_stage();
+        bool retired = (instructions_retired > insts_before);
+        
+        BackendStallReason commit_stall = BackendStallReason::NONE;
+        if (!retired && rob_count > 0) {
+            OpEntry &head = rob[rob_head];
+            if (!head.executed || head.execute_cycle > total_cycles) {
+                commit_stall = (head.inst.is_load && head.waiting_on_memory) 
+                             ? BackendStallReason::MEMORY_WAIT 
+                             : BackendStallReason::EXEC_WAIT;
+            }
+        }
+        
         issue_stage();
-        dispatch_stage();
+        BackendStallReason be_stall = dispatch_stage();
+        if (be_stall == BackendStallReason::NONE) be_stall = commit_stall;
+
         decode_stage();
         frontend->fetch_stage();
 
+        if (retired) profiler->inc_retired_insts(instructions_retired - insts_before);
+        
         total_cycles++;
+        bool fe_active = (total_cycles < fetch_stall_until);
+        profiler->mark_cycle(total_cycles, retired, fetch_stall_reason, fe_active, be_stall);
+
         if (total_cycles > MAX_SIM_TIME) {
             std::cout << "Simulation timeout reached!" << std::endl;
             break;
@@ -101,7 +131,8 @@ void TraceSim::advance_cycle() {
 }
 
 void TraceSim::commit_stage() {
-    for (uint32_t i = 0; i < fetch_bandwidth && rob_count > 0; ++i) {
+    // 逻辑已移回 run 循环内维护 retired 统计，此处维持功能性质
+    for (uint32_t i = 0; i < commit_width && rob_count > 0; ++i) {
         OpEntry &head_op = rob[rob_head];
         if (head_op.executed && head_op.execute_cycle <= total_cycles) {
             if (enable_dependent_load_profiling && head_op.inst.rd != 0) {
@@ -118,16 +149,6 @@ void TraceSim::commit_stage() {
             rob_head = (rob_head + 1) % rob_size;
             rob_count--;
             instructions_retired++;
-            
-            uint64_t rel_retired = instructions_retired - inst_retired_baseline;
-            uint64_t rel_cycles = total_cycles - total_cycles_baseline;
-            if (rel_retired > 0 && rel_retired % 10000000 == 0) {
-                std::cout << (in_warmup ? "[Warmup] " : "[Sample] ")
-                          << "Retired: " << rel_retired 
-                          << " Cycle: " << rel_cycles 
-                          << " IPC: " << std::fixed << std::setprecision(2) 
-                          << (double)rel_retired / rel_cycles << std::endl;
-            }
         } else {
             break;
         }
@@ -154,7 +175,7 @@ void TraceSim::issue_stage() {
     // 2. LSU Issue
     lsu->issue_stage();
 
-    // 3. STA/STD Issue (for Stores)
+    // 3. STA/STD Issue
     uint32_t sta_issued = 0;
     for (auto it = sta_iq.begin(); it != sta_iq.end() && sta_issued < fu_width.sta; ) {
         OpEntry &op = rob[*it];
@@ -207,24 +228,26 @@ void TraceSim::issue_stage() {
     }
 }
 
-void TraceSim::dispatch_stage() {
-    for (uint32_t i = 0; i < fetch_bandwidth && !fetch_queue.empty(); ++i) {
-        if (rob_count >= rob_size) break;
+BackendStallReason TraceSim::dispatch_stage() {
+    if (fetch_queue.empty()) return BackendStallReason::NONE;
+
+    for (uint32_t i = 0; i < dispatch_width && !fetch_queue.empty(); ++i) {
+        if (rob_count >= rob_size) return BackendStallReason::ROB_FULL;
         
         OpEntry& op = fetch_queue.front();
-        if (op.inst.is_trap && rob_count > 0) break;
+        if (op.inst.is_trap && rob_count > 0) return BackendStallReason::TRAP_SERIALIZE;
         
-        bool iq_full = false;
-        if (op.fu_type == FU_Type::ALU && alu_iq.size() >= alu_iq_size) iq_full = true;
-        else if (op.fu_type == FU_Type::BRU && bru_iq.size() >= bru_iq_size) iq_full = true;
+        if (op.fu_type == FU_Type::ALU && alu_iq.size() >= alu_iq_size) return BackendStallReason::ALU_IQ_FULL;
+        else if (op.fu_type == FU_Type::BRU && bru_iq.size() >= bru_iq_size) return BackendStallReason::BRU_IQ_FULL;
         else if (op.fu_type == FU_Type::LSU) {
-            if (op.inst.is_load && ldu_iq.size() >= ldu_iq_size) iq_full = true;
-            else if (op.inst.is_store && (sta_iq.size() >= sta_iq_size || std_iq.size() >= std_iq_size)) iq_full = true;
-            else if (!op.inst.is_load && !op.inst.is_store && alu_iq.size() >= alu_iq_size) iq_full = true;
+            if (op.inst.is_load && ldu_iq.size() >= ldu_iq_size) return BackendStallReason::LDU_IQ_FULL;
+            else if (op.inst.is_store && (sta_iq.size() >= sta_iq_size || std_iq.size() >= std_iq_size)) {
+                if (sta_iq.size() >= sta_iq_size) return BackendStallReason::STA_IQ_FULL;
+                return BackendStallReason::STD_IQ_FULL;
+            }
+            else if (!op.inst.is_load && !op.inst.is_store && alu_iq.size() >= alu_iq_size) return BackendStallReason::ALU_IQ_FULL;
         }
         
-        if (iq_full) break;
-
         uint32_t rob_idx = rob_tail;
         rob[rob_idx] = op;
         rob[rob_idx].dispatch_cycle = total_cycles;
@@ -242,7 +265,6 @@ void TraceSim::dispatch_stage() {
         rob_count++;
         fetch_queue.pop_front();
 
-        // Push to IQ
         if (op.inst.is_trap || op.fu_type == FU_Type::ALU) alu_iq.push_back(rob_idx);
         else if (op.fu_type == FU_Type::BRU) bru_iq.push_back(rob_idx);
         else if (op.fu_type == FU_Type::LSU) {
@@ -257,29 +279,24 @@ void TraceSim::dispatch_stage() {
             }
         }
     }
+    return BackendStallReason::NONE;
 }
 
 void TraceSim::decode_stage() {
-    // Connection: inst_buffer -> fetch_queue
-    while (!inst_buffer.empty() && fetch_queue.size() < fetch_bandwidth * 2) {
+    while (!inst_buffer.empty() && fetch_queue.size() < dispatch_width * 2) {
         fetch_queue.push_back(inst_buffer.front());
         inst_buffer.pop_front();
     }
 }
 
 void TraceSim::print_stats() {
-    uint64_t rel_inst = instructions_retired - inst_retired_baseline;
-    uint64_t rel_cycles = total_cycles - total_cycles_baseline;
+    profiler->print_summary(fetch_bandwidth, rob_size);
     
-    std::cout << "\n--- Simulation Statistics ---" << std::endl;
-    std::cout << "Total Instructions: " << rel_inst << std::endl;
-    std::cout << "Total Cycles: " << rel_cycles << std::endl;
-    if (rel_cycles > 0) {
-        std::cout << "Overall IPC: " << std::fixed << std::setprecision(2) 
-                  << (double)rel_inst / rel_cycles << std::endl;
-    }
-    std::cout << "STLF Hits: " << stats.stlf_hits << std::endl;
-    std::cout << "Memory Dependency Stalls: " << stats.mem_dep_stalls << "\n" << std::endl;
+    // 依然打印一些 Cache 的原始数据供参考
+    std::cout << "Raw Cache Stats:" << std::endl;
+    std::cout << "  I-Cache: " << icache.hit_count << "/" << icache.access_count << std::endl;
+    std::cout << "  D-Cache: " << dcache.hit_count << "/" << dcache.access_count << std::endl;
+    std::cout << "  LLC:     " << llc.hit_count << "/" << llc.access_count << std::endl;
 }
 
 void TraceSim::record_load_event(OpEntry&, bool, bool, uint32_t, bool, bool, bool) {}

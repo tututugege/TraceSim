@@ -7,7 +7,16 @@
 1. 说明现在的预取框架到底是怎么工作的
 2. 说明如果后续要继续改，应该从哪里改、按什么顺序改
 
-## 1. 当前实现到什么程度
+## 1. 核心架构适配
+
+在当前的模块化架构中，预取器不再通过 `TraceSim` 类直接调用，而是作为指令流和数据流的“旁路监测器”运行：
+
+- **Frontend (指令预取)**：当取指级完成对 `icache` 的访问后，会触发 `icache_prefetcher`。如果满足预取条件，请求将进入 `icache_prefetch_queue`。
+- **LoadStoreUnit (数据预取)**：当后端派发 Load 指令并访问 `dcache` 后，会触发 `dcache_prefetcher`。请求进入 `dcache_prefetch_queue`。
+
+这种设计使得预取逻辑与执行逻辑完全解耦，预取器的运行不会阻塞核心流水线级次。
+
+## 2. 当前实现到什么程度
 
 现在的模拟器已经具备下面这些能力：
 
@@ -56,6 +65,18 @@
   - 每周期发出的 prefetch 数量
 
 ## 3. 当前预取整体流程
+
+```mermaid
+graph TD
+    Trigger["Demand Access (IF/LSU)"] -->|Access Info| PF["Prefetcher (Next-Line/Stride)"]
+    PF -->|Candidate Addr| Filter{MSHR/Queue Filter}
+    Filter -->|Duplicate/Hit| Drop[Drop Request]
+    Filter -->|New Address| PQ["Prefetch Queue (I$/D$)"]
+    
+    PQ -->|"Cycle End (Issue Limit)"| MSHR["MSHR (In-flight Table)"]
+    MSHR -->|Request| LLC["Lower Level Memory"]
+    LLC -->|Data Return| Fill["Cache Line Fill (useful/useless tracking)"]
+```
 
 当前流程可以概括为：
 

@@ -19,7 +19,7 @@ LoadStoreUnit::StoreDepResult LoadStoreUnit::check_store_dependency(OpEntry &op)
             if (!st_op.sta_done) {
                 stall = true;
                 op.waiting_on_mem_dep = true;
-                sim.stats.mem_dep_stalls++;
+                sim.profiler->inc_mem_dep_stalls();
                 break;
             }
             if (st_op.inst.mem_addr == op.inst.mem_addr) {
@@ -41,7 +41,7 @@ LoadStoreUnit::StoreDepResult LoadStoreUnit::check_store_dependency(OpEntry &op)
             return StoreDepResult::STLFReady;
         }
         op.waiting_on_mem_dep = true;
-        sim.stats.mem_dep_stalls++;
+        sim.profiler->inc_mem_dep_stalls();
         return StoreDepResult::Stalled;
     }
     return StoreDepResult::NoDep;
@@ -128,7 +128,7 @@ LoadStoreUnit::LoadIssueResult LoadStoreUnit::try_issue_load(uint32_t rob_idx) {
     }
 
     if (dep_res == StoreDepResult::STLFReady) {
-        sim.stats.stlf_hits++;
+        sim.profiler->inc_stlf_hits();
         op.issue_cycle = sim.total_cycles;
         op.execute_cycle = sim.total_cycles + 1;
         if (op.inst.rd != 0) sim.reg_ready_time[op.inst.rd] = op.execute_cycle;
