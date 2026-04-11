@@ -20,6 +20,8 @@ struct OpEntry {
     // Memory Logic
     bool agu_done = false;
     uint64_t agu_cycle;
+    bool waiting_on_memory = false;
+    bool waiting_on_mem_dep = false;
 
     // Specialized Memory Units (Cracking for Stores)
     bool sta_done = false;

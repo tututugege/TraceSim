@@ -1,4 +1,4 @@
-CXXSRC = *.cpp trace_sim/*.cpp
+CXXSRC = *.cpp trace_sim/*.cpp trace_sim/frontend/*.cpp trace_sim/mem/*.cpp
 CXXINCLUDE = -I./include
 
 IMG=./baremetal/memory
