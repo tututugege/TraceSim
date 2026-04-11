@@ -1,6 +1,7 @@
 #include "TraceSim.h"
 #include "frontend/Frontend.h"
 #include "mem/LoadStoreUnit.h"
+#include "mem/MemSubsystem.h"
 #include "Profiler.h"
 #include <iomanip>
 
@@ -17,22 +18,16 @@ TraceSim::TraceSim(Ref_cpu &cpu, SimMode m,
       inst_buffer_size(TraceSimConfig::INST_BUFFER_SIZE),
       max_instructions(max_insts),
       enable_dependent_load_profiling(enable_dep_load_profile),
-      icache(TraceSimConfig::ICACHE_SIZE, TraceSimConfig::ICACHE_ASSOC, TraceSimConfig::ICACHE_LINE_SIZE), 
-      dcache(TraceSimConfig::DCACHE_SIZE, TraceSimConfig::DCACHE_ASSOC, TraceSimConfig::DCACHE_LINE_SIZE),
-      llc(TraceSimConfig::LLC_SIZE, TraceSimConfig::LLC_ASSOC, TraceSimConfig::LLC_LINE_SIZE),
       frontend(std::make_unique<Frontend>(*this)),
       lsu(std::make_unique<LoadStoreUnit>(*this)),
-      profiler(std::make_unique<Profiler>()) {
+      profiler(std::make_unique<Profiler>()),
+      mem(std::make_unique<MemSubsystem>()) {
     
     reg_ready_time.resize(32, 0);
     reg_last_writer.resize(32);
     reg_last_committed_writer.resize(32);
     rob.resize(rob_size);
-    if (TraceSimConfig::BP_TYPE == TraceSimConfig::BP_Type::GSHARE) {
-        bp = std::make_unique<GShareBranchPredictor>();
-    } else {
-        bp = std::make_unique<ProbabilisticBranchPredictor>(TraceSimConfig::BP_TARGET_ACCURACY);
-    }
+    bp = make_branch_predictor(TraceSimConfig::BP_TYPE);
     if (mode == SimMode::RESTORE && TraceSimConfig::WARMUP_INSTRUCTIONS > 0) {
         in_warmup = true;
     }
@@ -48,14 +43,38 @@ TraceSim::~TraceSim() = default;
 void TraceSim::reset_stats() {
     inst_retired_baseline = instructions_retired;
     total_cycles_baseline = total_cycles;
-    cache_baselines.icache_access = icache.access_count;
-    cache_baselines.icache_hit = icache.hit_count;
-    cache_baselines.dcache_access = dcache.access_count;
-    cache_baselines.dcache_hit = dcache.hit_count;
-    cache_baselines.llc_access = llc.access_count;
-    cache_baselines.llc_hit = llc.hit_count;
+    mem->reset_baselines();
+    load_profile_baseline = load_profile_stats;
     
     profiler->reset();
+}
+
+bool TraceSim::frontend_acquire_trace_inst(TraceInst &inst) {
+    if (!pre_fetch_buffer.empty()) {
+        inst = pre_fetch_buffer.front();
+        pre_fetch_buffer.pop_front();
+        return true;
+    }
+
+    inst = ref_cpu.step();
+    if (inst.is_wfi || inst.is_ebreak) {
+        std::cout << (inst.is_wfi ? "WFI" : "EBREAK")
+                  << " encountered at PC: 0x" << std::hex << inst.pc
+                  << std::dec << std::endl;
+        ref_cpu.sim_end = true;
+        return false;
+    }
+    return true;
+}
+
+void TraceSim::frontend_requeue_trace_inst(const TraceInst &inst) {
+    if (pre_fetch_buffer.empty()) {
+        pre_fetch_buffer.push_back(inst);
+    }
+}
+
+uint32_t TraceSim::icache_line_size() const {
+    return mem->icache_line_size();
 }
 
 void TraceSim::run() {
@@ -68,36 +87,34 @@ void TraceSim::run() {
               << ", STA_IQ=" << sta_iq_size << ", STD_IQ=" << std_iq_size 
               << ", BRU_IQ=" << bru_iq_size << std::endl;
 
-    while (!ref_cpu.sim_end || rob_count > 0 || !fetch_queue.empty() || !inst_buffer.empty()) {
-        process_cache_returns();
+    while (!ref_cpu.sim_end || rob_count > 0 || !fetch_queue.empty() ||
+           !inst_buffer.empty() || mem->has_pending_work()) {
+        mem->process_returns(total_cycles);
         advance_cycle();
 
         uint64_t insts_before = instructions_retired;
         commit_stage();
-        bool retired = (instructions_retired > insts_before);
-        
-        BackendStallReason commit_stall = BackendStallReason::NONE;
-        if (!retired && rob_count > 0) {
-            OpEntry &head = rob[rob_head];
-            if (!head.executed || head.execute_cycle > total_cycles) {
-                commit_stall = (head.inst.is_load && head.waiting_on_memory) 
-                             ? BackendStallReason::MEMORY_WAIT 
-                             : BackendStallReason::EXEC_WAIT;
-            }
-        }
-        
+        const bool retired = instructions_retired > insts_before;
+        const BackendStallReason commit_stall = classify_commit_stall(retired);
+
         issue_stage();
-        BackendStallReason be_stall = dispatch_stage();
-        if (be_stall == BackendStallReason::NONE) be_stall = commit_stall;
+        BackendStallReason backend_stall = dispatch_stage();
+        if (backend_stall == BackendStallReason::NONE) {
+            backend_stall = commit_stall;
+        }
 
         decode_stage();
         frontend->fetch_stage();
+        mem->service_prefetch_queues(total_cycles);
 
-        if (retired) profiler->inc_retired_insts(instructions_retired - insts_before);
+        if (retired) {
+            profiler->inc_retired_insts(instructions_retired - insts_before);
+        }
         
         total_cycles++;
-        bool fe_active = (total_cycles < fetch_stall_until);
-        profiler->mark_cycle(total_cycles, retired, fetch_stall_reason, fe_active, be_stall);
+        const bool frontend_stalled = total_cycles < fetch_stall_until;
+        profiler->mark_cycle(total_cycles, retired, fetch_stall_reason,
+                             frontend_stalled, backend_stall);
 
         if (total_cycles > MAX_SIM_TIME) {
             std::cout << "Simulation timeout reached!" << std::endl;
@@ -106,6 +123,23 @@ void TraceSim::run() {
     }
 
     print_stats();
+}
+
+BackendStallReason
+TraceSim::classify_commit_stall(bool retired_this_cycle) const {
+    if (retired_this_cycle || rob_count == 0) {
+        return BackendStallReason::NONE;
+    }
+
+    const OpEntry &head = rob[rob_head];
+    if (head.executed && head.execute_cycle <= total_cycles) {
+        return BackendStallReason::NONE;
+    }
+
+    if (head.inst.is_load && head.waiting_on_memory) {
+        return BackendStallReason::MEMORY_WAIT;
+    }
+    return BackendStallReason::EXEC_WAIT;
 }
 
 void TraceSim::advance_cycle() {
@@ -291,14 +325,46 @@ void TraceSim::decode_stage() {
 
 void TraceSim::print_stats() {
     profiler->print_summary(fetch_bandwidth, rob_size);
-    
-    // 依然打印一些 Cache 的原始数据供参考
-    std::cout << "Raw Cache Stats:" << std::endl;
-    std::cout << "  I-Cache: " << icache.hit_count << "/" << icache.access_count << std::endl;
-    std::cout << "  D-Cache: " << dcache.hit_count << "/" << dcache.access_count << std::endl;
-    std::cout << "  LLC:     " << llc.hit_count << "/" << llc.access_count << std::endl;
+    mem->print_stats(std::cout);
+
+    if (enable_dependent_load_profiling) {
+        const uint64_t total = load_profile_stats.total - load_profile_baseline.total;
+        const uint64_t dependent =
+            load_profile_stats.dependent - load_profile_baseline.dependent;
+        const uint64_t stlf = load_profile_stats.stlf - load_profile_baseline.stlf;
+        const uint64_t l1_hit = load_profile_stats.l1_hit - load_profile_baseline.l1_hit;
+        const uint64_t l2_hit = load_profile_stats.l2_hit - load_profile_baseline.l2_hit;
+        const uint64_t dram = load_profile_stats.dram - load_profile_baseline.dram;
+        const uint64_t total_latency =
+            load_profile_stats.total_latency - load_profile_baseline.total_latency;
+
+        std::cout << "Load Profile:" << std::endl;
+        std::cout << "  total=" << total << ", dependent=" << dependent
+                  << ", stlf=" << stlf << ", l1_hit=" << l1_hit
+                  << ", l2_hit=" << l2_hit << ", dram=" << dram;
+        if (total > 0) {
+            std::cout << ", avg_latency=" << std::fixed << std::setprecision(2)
+                      << static_cast<double>(total_latency) / total;
+        }
+        std::cout << std::endl;
+    }
 }
 
-void TraceSim::record_load_event(OpEntry&, bool, bool, uint32_t, bool, bool, bool) {}
-void TraceSim::enqueue_prefetches(Cache &, uint32_t, uint32_t, bool, bool) {}
-void TraceSim::service_prefetch_queues() {}
+void TraceSim::record_load_event(OpEntry&, bool dep, bool stlf, uint32_t lat,
+                                 bool l1h, bool l2h, bool dram) {
+    load_profile_stats.total++;
+    load_profile_stats.total_latency += lat;
+    if (dep) {
+        load_profile_stats.dependent++;
+    }
+    if (stlf) {
+        load_profile_stats.stlf++;
+    }
+    if (l1h) {
+        load_profile_stats.l1_hit++;
+    } else if (l2h) {
+        load_profile_stats.l2_hit++;
+    } else if (dram) {
+        load_profile_stats.dram++;
+    }
+}

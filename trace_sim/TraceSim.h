@@ -11,7 +11,6 @@
 #include <array>
 
 #include "SimConfig.h"
-#include "mem/Cache.h"
 #include "frontend/BranchPredictor.h"
 #include "frontend/FrontendTypes.h"
 #include "Profiler.h"
@@ -21,6 +20,7 @@
 class Frontend;
 class LoadStoreUnit;
 class Profiler;
+class MemSubsystem;
 
 class TraceSim {
 public:
@@ -30,6 +30,7 @@ public:
     Ref_cpu &ref_cpu;
     std::unique_ptr<BranchPredictor> bp;
     std::unique_ptr<Profiler> profiler;
+    std::unique_ptr<MemSubsystem> mem;
 
     uint64_t total_cycles = 0;
     uint64_t instructions_retired = 0;
@@ -63,8 +64,8 @@ public:
     std::vector<uint32_t> std_iq;
     std::vector<uint32_t> bru_iq;
 
-    std::deque<uint32_t> store_indices; 
-    
+    std::deque<uint32_t> store_indices;
+
     // Buffers and Queues
     std::deque<OpEntry> inst_buffer;
     std::deque<TraceInst> pre_fetch_buffer;
@@ -74,11 +75,6 @@ public:
     uint64_t fetch_stall_until = 0;
     FetchStallReason fetch_stall_reason = FetchStallReason::NONE;
     BoundReason frontend_bound_hint = BoundReason::NONE;
-
-    // Cache Models
-    Cache icache;
-    Cache dcache;
-    Cache llc;
 
     struct {
         uint32_t alu = TraceSimConfig::ALU_COUNT;
@@ -137,20 +133,69 @@ public:
     BackendStallReason dispatch_stage();
     void decode_stage();
     void advance_cycle();
-
-    void process_cache_returns() {
-        icache.process_returns(total_cycles);
-        dcache.process_returns(total_cycles);
-        llc.process_returns(total_cycles);
+    BackendStallReason classify_commit_stall(bool retired_this_cycle) const;
+    bool frontend_stall_active() const {
+        return total_cycles < fetch_stall_until;
+    }
+    bool frontend_can_fetch() const {
+        return !frontend_stall_active() && inst_buffer.size() < inst_buffer_size;
+    }
+    bool frontend_trace_exhausted() const {
+        return ref_cpu.sim_end && pre_fetch_buffer.empty();
+    }
+    bool frontend_acquire_trace_inst(TraceInst &inst);
+    void frontend_requeue_trace_inst(const TraceInst &inst);
+    void push_inst_buffer(OpEntry op) { inst_buffer.push_back(std::move(op)); }
+    void set_frontend_bound_hint(BoundReason reason) {
+        frontend_bound_hint = reason;
+    }
+    uint32_t icache_line_size() const;
+    bool is_register_ready(uint32_t reg) const {
+        return reg_ready_time[reg] <= total_cycles;
+    }
+    void mark_register_ready(uint32_t reg, uint64_t ready_cycle) {
+        if (reg != 0) {
+            reg_ready_time[reg] = ready_cycle;
+        }
+    }
+    void clear_load_memory_flags(OpEntry &op) const {
+        op.waiting_on_memory = false;
+        op.waiting_on_mem_dep = false;
+    }
+    void mark_waiting_on_memory(OpEntry &op) const {
+        op.waiting_on_memory = true;
+    }
+    void mark_waiting_on_mem_dep(OpEntry &op) const {
+        op.waiting_on_mem_dep = true;
+    }
+    void classify_load_if_needed(OpEntry &op) const {
+        if (enable_dependent_load_profiling && !op.load_classified) {
+            op.is_dependent_load = op.base_writer_valid && op.base_writer_is_load;
+            op.load_classified = true;
+        }
+    }
+    void mark_load_executed(OpEntry &op, uint64_t ready_cycle) {
+        op.issue_cycle = total_cycles;
+        op.execute_cycle = ready_cycle;
+        mark_register_ready(op.inst.rd, ready_cycle);
+        op.executed = true;
     }
 
     uint64_t inst_retired_baseline = 0;
     uint64_t total_cycles_baseline = 0;
-    struct {
-        uint64_t icache_access = 0, icache_hit = 0;
-        uint64_t dcache_access = 0, dcache_hit = 0;
-        uint64_t llc_access = 0, llc_hit = 0;
-    } cache_baselines;
+
+    struct LoadProfileSnapshot {
+        uint64_t total = 0;
+        uint64_t dependent = 0;
+        uint64_t stlf = 0;
+        uint64_t l1_hit = 0;
+        uint64_t l2_hit = 0;
+        uint64_t dram = 0;
+        uint64_t total_latency = 0;
+    };
+
+    LoadProfileSnapshot load_profile_baseline;
+    LoadProfileSnapshot load_profile_stats;
 
     void record_load_event(OpEntry& op, bool dep, bool stlf, uint32_t lat, bool l1h, bool l2h, bool dram);
 
@@ -160,8 +205,6 @@ public:
         return FU_Type::ALU;
     }
 
-    void enqueue_prefetches(Cache &l1, uint32_t pc, uint32_t addr, bool hit, bool is_data);
-    void service_prefetch_queues();
 };
 
 #include "frontend/Frontend.h"

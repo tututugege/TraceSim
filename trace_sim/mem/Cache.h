@@ -103,6 +103,18 @@ public:
         return addr & ~(line_size - 1);
     }
 
+    bool contains(uint32_t addr) const {
+        const uint32_t index = (addr >> offset_bits) & index_mask;
+        const uint32_t tag = addr >> (offset_bits + index_bits);
+        const auto &set = sets[index];
+        for (const auto &line : set) {
+            if (line.valid && line.tag == tag) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     AccessResult request(uint32_t addr, uint64_t current_cycle,
                          bool is_prefetch = false) {
         if (is_prefetch) {

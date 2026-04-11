@@ -5,6 +5,8 @@
 #include <memory>
 #include <vector>
 
+#include "../SimConfig.h"
+
 class CacheReplacementPolicy {
 public:
     struct LineView {
@@ -107,10 +109,58 @@ public:
     }
 };
 
+class TemplateReplacementPolicy : public CacheReplacementPolicy {
+public:
+    const char *name() const override { return "template-replacement"; }
+
+    size_t choose_victim(
+        uint32_t,
+        const std::vector<LineView> &set_lines) const override {
+        for (size_t i = 0; i < set_lines.size(); ++i) {
+            if (!set_lines[i].valid) {
+                return i;
+            }
+        }
+
+        // Replace this with your own victim-selection logic.
+        return 0;
+    }
+
+    void on_cache_hit(
+        uint32_t,
+        size_t way,
+        uint64_t cycle,
+        std::vector<LineView> &set_lines) const override {
+        // Replace this with your own metadata update logic.
+        set_lines[way].last_access = cycle;
+    }
+
+    void on_cache_fill(
+        uint32_t,
+        size_t way,
+        uint64_t cycle,
+        std::vector<LineView> &set_lines) const override {
+        // Replace this with your own fill-time metadata update logic.
+        set_lines[way].last_access = cycle;
+        set_lines[way].insertion_time = cycle;
+    }
+};
+
 inline std::unique_ptr<CacheReplacementPolicy> make_lru_replacement_policy() {
     return std::make_unique<LruReplacementPolicy>();
 }
 
 inline std::unique_ptr<CacheReplacementPolicy> make_fifo_replacement_policy() {
     return std::make_unique<FifoReplacementPolicy>();
+}
+
+inline std::unique_ptr<CacheReplacementPolicy>
+make_replacement_policy(TraceSimConfig::ReplacementPolicyType type) {
+    switch (type) {
+    case TraceSimConfig::ReplacementPolicyType::FIFO:
+        return make_fifo_replacement_policy();
+    case TraceSimConfig::ReplacementPolicyType::LRU:
+    default:
+        return make_lru_replacement_policy();
+    }
 }

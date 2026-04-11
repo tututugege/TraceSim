@@ -1,49 +1,109 @@
-# TraceSim 分支预测 (BPU) 研究手册
+# TraceSim 分支预测说明
 
-分支预测器性能是实现高 IPC 的关键。TraceSim 将分支预测逻辑深度集成在 `Frontend` 模块中，并支持乱序执行环境下的异步更新。
+这份文档描述当前仓库里已经实现的分支预测接口和行为。
 
-## 1. 预测与更新流程
+## 1. 当前接口
 
-```mermaid
-sequenceDiagram
-    participant FE as Frontend (Fetch Stage)
-    participant BP as Branch Predictor
-    participant EX as Execute/Commit Stage
-    
-    FE->>BP: Request Prediction (PC)
-    BP-->>FE: Taken / Not-Taken
-    FE->>FE: If Prediction differs from sequential PC,<br/>stall 1 cycle (Redirect)
-    
-    Note over EX: Branch Resolves in Backend
-    
-    EX->>BP: Update Predictor (PC, Actual Result)
-    EX->>FE: If Mispredict, Flush Pipeline (10 cycle penalty)
+分支预测器接口在 [trace_sim/frontend/BranchPredictor.h](/home/tututu/TraceSim/trace_sim/frontend/BranchPredictor.h)。
+
+核心接口如下：
+
+```cpp
+class BranchPredictor {
+public:
+    struct Prediction {
+        bool taken = false;
+        uint64_t meta = 0;
+    };
+
+    virtual ~BranchPredictor() = default;
+    virtual const char *name() const = 0;
+    virtual Prediction predict(uint32_t pc) = 0;
+    virtual void update(uint32_t pc, bool actual_taken, uint64_t meta) = 0;
+};
 ```
 
-## 2. 内置算法
+设计意图是：
 
-### 2.1 GShare Predictor
-- **逻辑**: 使用全局历史寄存器 (GHR) 与分支 PC 进行异或 (XOR) 后索引模式历史表 (PHT)。
-- **状态机**: PHT 存储 2-bit 饱和计数器（Strongly/Weekly Taken/Not-Taken）。
-- **优势**: 能捕捉到指令间的相关性，适合 Dhrystone 等具有模式规律的 benchmark。
+- `predict()` 只负责预测
+- `update()` 只负责训练
+- `meta` 用来把预测阶段查出来的索引或中间状态带到训练阶段，避免重复查表
 
-### 2.2 Probabilistic Predictor
-- **逻辑**: 一个理想混合模型，支持手动设置 `BP_TARGET_ACCURACY`。
-- **用途**: 用于快速扫描不同准确率对整体 IPC 的敏感性（Sensitivity Analysis），无需编写复杂的硬件算法。
+## 2. 当前内置模式
 
-## 3. 性能归因判据
+当前配置枚举在 [trace_sim/SimConfig.h](/home/tututu/TraceSim/trace_sim/SimConfig.h)。
 
-BPU 的表现直接体现在 Profiler 的两个指标上：
-- **Accuracy**: 基础预测准确率。
-- **Bad Speculation**: 由于预测错误导致的无效周期占比。
+已支持：
 
-> [!NOTE]
-> **延迟区分**：正确预测的 Taken 分支仅导致 1 周期的 `FETCH_REDIRECT` 重定向延迟；而预测错误的分支则会引发 10 周期的 `BRANCH_MISPREDICT` 惩罚。
+- `GSHARE`
+- `ALWAYS_TAKEN`
+- `ALWAYS_NOT_TAKEN`
+- `PROBABILISTIC`
+- `PERFECT`
 
-## 4. 研究方向
-1. **BTB (Branch Target Buffer)**: 当前模拟器假设 BTB 始终命中，未来可以引入容量受限的 BTB 建模。
-2. **多级预测器**: 实现类似 **TAGE** 的复杂预测架构，研究其对长依赖分支流的覆盖效果。
+其中前 3 个是“真实 predictor 对象”。
 
----
-> [!WARNING]
-> 分支预测器的更新逻辑目前位于 Fetch 阶段（在线 Trace 优势），在真实的流水线中更新通常发生在执行级。研究高级 BPU 时需注意由于更新延迟（Update Lag）导致的预测漂移。
+后 2 个是 oracle 模式：
+
+- `PROBABILISTIC`
+  - 按 `BP_TARGET_ACCURACY` 概率决定是否预测正确
+- `PERFECT`
+  - 永远返回真实方向
+
+这两种模式主要用于做上界或敏感性分析。
+
+## 3. 预测发生在什么时候
+
+当前预测发生在前端取指时，也就是 `Frontend::fetch_stage()` 里。
+
+大致流程是：
+
+1. 前端取到一条 branch
+2. 调用 BPU 做方向预测
+3. 立刻用 trace 里的真实结果判断是否预测正确
+4. 若使用真实 predictor，则调用 `update()`
+5. 若预测错误，设置 `BRANCH_MISPREDICT_PENALTY`
+6. 若预测正确但分支被 taken，则设置 `FETCH_REDIRECT_LATENCY`
+
+这意味着当前模型更接近“fetch-time training”的简化实现，而不是“执行后才 resolve 再 update”的严格硬件时序。
+
+## 4. 当前惩罚模型
+
+当前有两类主要分支相关代价：
+
+- `FETCH_REDIRECT_LATENCY`
+  - 正确预测的 taken branch / jump 的 redirect 代价
+- `BRANCH_MISPREDICT_PENALTY`
+  - 误预测导致的前端停顿代价
+
+这两个参数都定义在 [trace_sim/SimConfig.h](/home/tututu/TraceSim/trace_sim/SimConfig.h)。
+
+## 5. 当前实现边界
+
+当前 BPU 模型已经足够支持：
+
+- 静态 predictor 基线
+- GShare 这类基础动态 predictor
+- 完美预测 / 指定准确率上界实验
+
+但它还没有实现：
+
+- BTB 容量与冲突
+- target prediction 细节
+- RAS
+- 多级 predictor 组合逻辑
+- 真正的 execute-time update 延迟
+
+所以如果你要研究非常细的前端时序，这个模型还需要继续扩展。
+
+## 6. 如何加自己的 predictor
+
+最简单的方式是：
+
+1. 在 [trace_sim/frontend/BranchPredictor.h](/home/tututu/TraceSim/trace_sim/frontend/BranchPredictor.h) 里复制 `TemplateBranchPredictor`
+2. 改名并实现自己的 `predict()` / `update()`
+3. 在 `BP_Type` 里加一个新枚举
+4. 在 `make_branch_predictor()` 工厂里加一个 `case`
+5. 在 [trace_sim/SimConfig.h](/home/tututu/TraceSim/trace_sim/SimConfig.h) 里把 `BP_TYPE` 切过去
+
+如果只是想测上界，不需要新类，直接用 `PERFECT` 即可。

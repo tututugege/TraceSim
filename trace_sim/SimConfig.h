@@ -6,7 +6,13 @@ namespace TraceSimConfig {
 // =============================================================================
 // 1. 分支预测器配置 (Branch Predictor)
 // =============================================================================
-enum class BP_Type { GSHARE, PROBABILISTIC };
+enum class BP_Type {
+    GSHARE,
+    ALWAYS_TAKEN,
+    ALWAYS_NOT_TAKEN,
+    PROBABILISTIC,
+    PERFECT
+};
 constexpr BP_Type BP_TYPE = BP_Type::GSHARE;
 constexpr uint32_t BP_TARGET_ACCURACY = 95;  // 用于概率模型的准确率
 
@@ -54,20 +60,36 @@ constexpr uint32_t MEMORY_MISS_PENALTY = 120; // DRAM 访问延迟 (L2 Miss)
 // =============================================================================
 // 5. 存储层次参数 (Cache Parameters)
 // =============================================================================
+enum class ReplacementPolicyType { LRU, FIFO };
+enum class PrefetcherType { NONE, NEXT_LINE, PC_STRIDE };
+
 // I-Cache: 32 KB, 8-way
 constexpr uint32_t ICACHE_SIZE      = 32768; 
 constexpr uint32_t ICACHE_ASSOC     = 8;
 constexpr uint32_t ICACHE_LINE_SIZE = 64;
+constexpr uint32_t ICACHE_MSHR_SIZE = 16;
+constexpr ReplacementPolicyType ICACHE_REPLACEMENT = ReplacementPolicyType::LRU;
+constexpr PrefetcherType ICACHE_PREFETCHER = PrefetcherType::NONE;
+constexpr uint32_t ICACHE_PREFETCH_QUEUE_SIZE = 16;
+constexpr uint32_t ICACHE_PREFETCH_ISSUE_PER_CYCLE = 1;
 
 // D-Cache: 32 KB, 8-way
 constexpr uint32_t DCACHE_SIZE      = 32768; 
 constexpr uint32_t DCACHE_ASSOC     = 8;
 constexpr uint32_t DCACHE_LINE_SIZE = 64;
+constexpr uint32_t DCACHE_MSHR_SIZE = 16;
+constexpr ReplacementPolicyType DCACHE_REPLACEMENT = ReplacementPolicyType::LRU;
+constexpr PrefetcherType DCACHE_PREFETCHER = PrefetcherType::NONE;
+constexpr uint32_t DCACHE_PREFETCH_QUEUE_SIZE = 16;
+constexpr uint32_t DCACHE_PREFETCH_ISSUE_PER_CYCLE = 1;
 
 // L2 Cache (Unified): 512 KB, 8-way
 constexpr uint32_t LLC_SIZE       = 524288; 
 constexpr uint32_t LLC_ASSOC      = 8;
 constexpr uint32_t LLC_LINE_SIZE  = 64;
+constexpr uint32_t LLC_MSHR_SIZE  = 32;
+constexpr ReplacementPolicyType LLC_REPLACEMENT = ReplacementPolicyType::LRU;
+constexpr PrefetcherType LLC_PREFETCHER = PrefetcherType::NONE;
 
 // =============================================================================
 // 6. 访存依赖模型 (Memory Dependency)

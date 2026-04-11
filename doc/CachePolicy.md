@@ -1,45 +1,118 @@
-# TraceSim 缓存层次与替换策略说明
+# TraceSim Cache 与替换策略说明
 
-本模拟器实现了一个参数化、循环精确的存储层次模型，支持非阻塞访问（Non-blocking Access）和可插拔的替换算法。
+这份文档描述当前 cache 本体和替换策略接口。
 
-## 1. 存储层次拓扑
+## 1. 当前 cache 不是纯延迟函数
 
-```mermaid
-graph TD
-    CPU["CPU Core (Pipeline)"] -->|I-Access| IC["L1 I-Cache (Private)"]
-    CPU -->|D-Access| DC["L1 D-Cache (Private)"]
-    IC -->|Miss| LLC["L2 / LLC (Unified)"]
-    DC -->|Miss| LLC
-    LLC -->|Miss| DRAM["Main Memory (DRAM)"]
+当前 cache 实现在 [trace_sim/mem/Cache.h](/home/tututu/TraceSim/trace_sim/mem/Cache.h)。
+
+它已经维护了真实状态：
+
+- set / way
+- tag
+- valid
+- line metadata
+- in-flight request table
+
+因此当前 cache fill、eviction、merge 都会真正修改状态，而不是简单返回一个固定延迟。
+
+## 2. 当前 line metadata
+
+`Cache::Line` 当前至少包含：
+
+- `tag`
+- `valid`
+- `prefetched`
+- `used_by_demand`
+- `last_access`
+- `insertion_time`
+- `fill_cycle`
+
+这些字段分别支持：
+
+- 基本 tag match
+- replacement state 更新
+- useful / useless prefetch 统计
+- 最近访问和插入时间跟踪
+
+## 3. 当前替换策略接口
+
+接口在 [trace_sim/mem/ReplacementPolicy.h](/home/tututu/TraceSim/trace_sim/mem/ReplacementPolicy.h)。
+
+核心接口如下：
+
+```cpp
+class CacheReplacementPolicy {
+public:
+    struct LineView {
+        bool valid = false;
+        uint32_t tag = 0;
+        uint64_t last_access = 0;
+        uint64_t insertion_time = 0;
+    };
+
+    virtual ~CacheReplacementPolicy() = default;
+    virtual const char *name() const = 0;
+    virtual size_t choose_victim(
+        uint32_t set_index,
+        const std::vector<LineView> &set_lines) const = 0;
+    virtual void on_cache_hit(
+        uint32_t set_index,
+        size_t way,
+        uint64_t cycle,
+        std::vector<LineView> &set_lines) const = 0;
+    virtual void on_cache_fill(
+        uint32_t set_index,
+        size_t way,
+        uint64_t cycle,
+        std::vector<LineView> &set_lines) const = 0;
+};
 ```
 
-## 2. 缓存建模细节
+当前内置：
 
-### 2.1 组织形式
-- **Set-Associative**: 支持 N 路组相联配置（通过 `SimConfig.h` 设置）。
-- **Line Size**: 默认 64 字节，为后端访存的基本单位。
-- **MSHR (In-flight Requests)**: 采用了内部 `unordered_map<uint32_t, InflightRequest>` 管理在途请求，支持 Demand 和 Prefetch 的请求合并（Merge）。
+- `LRU`
+- `FIFO`
 
-### 2.2 当前替换策略：LRU (Least Recently Used)
-当前每个 `CacheLine` 包含一个 `last_access` 时间戳。
-- **命中 (Hit)**：更新该 Line 的 `last_access` 为当前系统周期。
-- **替换 (Eviction)**：遍历当前 Set 内的所有 Way，挑选出 `last_access` 最小（即最久未被使用）的行进行剔除。
+## 4. 当前替换流程
 
-## 3. 实验指引：如何实现新的替换策略
+当 cache fill 发生时，流程大致是：
 
-若要研究更高级的算法（如 **LFU** 或 **RRIP**），建议按以下步骤操作：
+1. 根据地址找到 set
+2. 构造当前 set 的 `LineView`
+3. 调用 `choose_victim()`
+4. 如 victim 是未被 demand 使用过的 prefetched line，统计 `useless_prefetch`
+5. 安装新 line
+6. 调用 `on_cache_fill()` 更新 replacement metadata
 
-1. **扩展 Metadata**：在 `trace_sim/Cache.h` 的 `Cache::Line` 结构中增加统计字段（如 `access_count` 或 `rrip_value`）。
-2. **重载选取逻辑**：在 `find_victim()` 函数中，将基于 `last_access` 的排序逻辑替换为目标算法。
-3. **监控指标**：通过 `Profiler` 生成的 `Memory Bound` 占比来评估新策略对系统 IPC 的实质提升。
+当 cache hit 时：
 
-## 4. 关键配置项 (SimConfig.h)
-- `ICACHE_SIZE / ICACHE_ASSOC`: 前端指令缓存参数。
-- `DCACHE_SIZE / DCACHE_ASSOC`: 后端数据缓存参数。
-- `LLC_SIZE / LLC_ASSOC`: 统一二级缓存参数。
-- `LLC_HIT_LATENCY`: 二级缓存命中惩罚。
-- `MEMORY_MISS_PENALTY`: 主存访问惩罚（DRAM Latency）。
+1. 找到命中的 way
+2. 调用 `on_cache_hit()`
+3. 把更新后的 `LineView` 写回真实 line 状态
 
----
-> [!IMPORTANT]
-> 由于模拟器采用了解耦架构，修改缓存延迟或策略会直接反映在 `Profiler` 的 **Backend Memory Bound** 指标上，这为定量分析提供了极大的便利。
+## 5. 当前设计的取舍
+
+这个接口的优点是：
+
+- 简单
+- 可插拔
+- 对做算法原型验证足够快
+
+它的限制也很明确：
+
+- policy 目前只能看到 `LineView`
+- 还看不到更丰富的上下文，比如 PC、prefetch 来源、reuse hint
+- 还没有专门的 prefetch-aware insertion / bypass 接口
+
+所以如果你要做 RRIP、DIP、Hawkeye 这一类更复杂的策略，后面大概率还要再扩展接口。
+
+## 6. 如何加自己的替换策略
+
+最简单的方式是：
+
+1. 在 [trace_sim/mem/ReplacementPolicy.h](/home/tututu/TraceSim/trace_sim/mem/ReplacementPolicy.h) 里复制 `TemplateReplacementPolicy`
+2. 实现自己的 victim 选择和 metadata 更新
+3. 在 `ReplacementPolicyType` 里加一个新枚举
+4. 在 `make_replacement_policy()` 里加一个 `case`
+5. 在 [trace_sim/SimConfig.h](/home/tututu/TraceSim/trace_sim/SimConfig.h) 里切 `ICACHE_REPLACEMENT`、`DCACHE_REPLACEMENT` 或 `LLC_REPLACEMENT`

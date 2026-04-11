@@ -1,58 +1,109 @@
-# TraceSim Top-Down 归因指南 (Level 1 & 2)
+# TraceSim Top-down 归因说明
 
-TraceSim 采用了业界标准的 Top-Down 性能分析模型，通过将每周期的处理器状态归类到不同的“桶 (Bucket)”中，量化由于取指、后端执行、数据依赖或分支误预测导致的性能损失。
+这份文档描述的是当前 `Profiler` 真正实现的归因口径。
 
-## 1. 判定优先级逻辑
+## 1. 当前 bucket
 
-当模拟器推进到每一拍结束时，`Profiler` 会通过以下优先级逻辑对该周期进行归因：
+当前归因桶定义在 [trace_sim/Profiler.h](/home/tututu/TraceSim/trace_sim/Profiler.h)：
 
-```mermaid
-graph TD
-    Start((Cycle Start)) --> IsRetired{是否有指令退休?}
-    IsRetired -->|Yes| Retiring[Retiring Bucket]
-    
-    IsRetired -->|No| BE_Stalled{后端是否有指令在执行<br/>但被阻塞?}
-    BE_Stalled -->|Yes| IsMem{是否由于 Memory 导致?}
-    IsMem -->|Yes| MEM_Bound[Memory Bound]
-    IsMem -->|No| CORE_Bound[Core Bound]
-    
-    BE_Stalled -->|No| FE_Stalled{前端是否活跃停顿?}
-    FE_Stalled -->|Yes| IsBranch{是否由于分支误预测?}
-    IsBranch -->|Yes| BadSpec[Bad Speculation]
-    IsBranch -->|No| FE_Bound[Frontend Bound]
-    
-    FE_Stalled -->|No| Other[Other / Bubbles]
-```
+- `Retiring`
+- `Frontend Bound`
+- `Memory Bound`
+- `Core Bound`
+- `Bad Speculation`
+- `Other/Bubbles`
 
-## 2. Bucket 详细定义
+这里的 `Memory Bound` 和 `Core Bound` 是 `Backend Bound` 的二级拆分。
 
-### 2.1 Retiring (有效执行)
-- **定义**: 至少有一条指令成功退休。
-- **含义**: 处理器正在执行有用的工作。这并不意味着达到了 100% 的效率，但在周级粗粒度归因中，这被视为有效周期。
+## 2. 当前每周期判定顺序
 
-### 2.2 Bad Speculation (误预测惩罚)
-- **定义**: 该周期没有任何退休，且前端处于由于 **分支预测错误** (`BRANCH_MISPREDICT`) 导致的刷新/停顿状态中。
-- **指示器**: 反映了分支预测器不够精准带来的流水线开销。
+当前 `Profiler::mark_cycle()` 的优先级很直接：
 
-### 2.3 Frontend Bound (前端局限)
-- **定义**: 该周期无退休，且前端处于 **活跃停顿**（除误预测外，如 `ICACHE_MISS`, `LINE_BOUNDARY`）。或是后端有资源可用，但前端提供的指令填不满 Dispatch 带宽。
-- **优化点**: 增大 I-Cache 命中率、优化指令缓冲区大小、提高取指带宽或对齐策略。
+1. 如果本周期有退休，记为 `Retiring`
+2. 否则如果后端有 stall reason：
+   - `MEMORY_WAIT` -> `Memory Bound`
+   - 其他后端原因 -> `Core Bound`
+3. 否则如果前端 stall：
+   - `BRANCH_MISPREDICT` -> `Bad Speculation`
+   - 其他前端原因 -> `Frontend Bound`
+4. 否则 -> `Other/Bubbles`
 
-### 2.4 Backend Bound (后端局限)
-- **分类**:
-    - **Memory Bound**: 当 ROB 头部指令（Head）正在等待 L1-D Cache 或主存的数据返回。这通常与 Cache Hit Rate 相关。
-    - **Core Bound**: 后端资源（ROB/IQ）已满，或者是因为 **数据依赖（Data-flow Dependency）** 导致指令即使在 IQ 中也无法发射。
-- **优化点**: 增加 ROB/IQ 容量、增加执行单元数量、优化调度器逻辑、或引入预取器（针对 Memory Bound）。
+这意味着当前模型采用的是“单桶归因”，每个周期只进一个桶。
 
-## 3. 如何使用归因数据进行优化？
+## 3. 当前前端归因
 
-| 当观察到以下现象... | 建议尝试的优化方案 |
-| :--- | :--- |
-| **Frontend Bound 占比过高** | 确认 I-Cache 大小是否不足；尝试通过对齐优化减少跨行停顿。 |
-| **Core Bound 占比过高** | 检查指令间的数据依赖是否过密；尝试增加发射宽度或 ALU 数量。 |
-| **Memory Bound 占比过高** | 提高 D-Cache 大小或相联度；检查 STLF 效率；**开启预取器 (Prefetcher)**。 |
-| **Bad Speculation 占比过高** | 升级分支预测算法（如从静态切换到 Gshare）。 |
+前端相关原因来自 `FetchStallReason`。当前会影响归因的典型来源包括：
 
----
-> [!TIP]
-> 真实的处理器调优通常是先看宏观的 Top-down 比例，锁定瓶颈模块后，再通过微观统计（如 Cache Hit Rate, BP Accuracy）定位具体根因。
+- `ICACHE_MISS`
+- `LINE_BOUNDARY`
+- `FETCH_REDIRECT`
+- `BRANCH_MISPREDICT`
+
+其中：
+
+- `BRANCH_MISPREDICT` 归到 `Bad Speculation`
+- 其余前端 stall 归到 `Frontend Bound`
+
+所以当前模型已经把“误预测气泡”和“其他前端供应不足”分开了。
+
+## 4. 当前后端归因
+
+后端 stall reason 主要来自：
+
+- `dispatch_stage()`
+  - `ROB_FULL`
+  - `ALU_IQ_FULL`
+  - `LDU_IQ_FULL`
+  - `STA_IQ_FULL`
+  - `STD_IQ_FULL`
+  - `BRU_IQ_FULL`
+  - `TRAP_SERIALIZE`
+- `classify_commit_stall()`
+  - `MEMORY_WAIT`
+  - `EXEC_WAIT`
+
+当前最关键的 simplification 是：
+
+- 如果 ROB head 是 load 且 `waiting_on_memory`，就归到 `Memory Bound`
+- 其他 head stall 或资源类 stall，都归到 `Core Bound`
+
+这和你之前想要的“尽量按 ROB head 来看 memory bound”是一致的。
+
+## 5. 当前模型的意义和局限
+
+这套实现适合做：
+
+- 宏观瓶颈定位
+- 对比不同 BPU / prefetcher / cache policy 时的方向性变化
+- 判断性能变化主要来自前端、内存还是核心资源
+
+但它不是 Intel 原版 top-down 的严格复制。它没有做例如：
+
+- 重叠归因
+- 更细的 FE latency / FE bandwidth 拆分
+- memory latency / memory bandwidth 的进一步拆分
+- allocator、rename、scheduler 等更细的 core bound 子类
+
+## 6. 如何解读当前输出
+
+一个比较实用的读法是：
+
+- `Retiring` 高：整体吞吐还可以
+- `Bad Speculation` 高：优先看 BPU
+- `Frontend Bound` 高：优先看 I$、fetch 宽度、redirect、inst buffer
+- `Memory Bound` 高：优先看 D$ / LLC / prefetch / miss latency
+- `Core Bound` 高：优先看 ROB / IQ / FU 数量 / 数据依赖
+- `Other/Bubbles` 高：说明还有模型空洞，或者流水线存在未细分的气泡
+
+## 7. 当前最适合继续补的方向
+
+如果后面要继续细化 top-down，比较自然的顺序是：
+
+1. 细化 `Frontend Bound`
+   - 比如区分 `I-Cache miss`、`redirect`、`line boundary`
+2. 细化 `Core Bound`
+   - 比如区分不同 IQ full、ROB full、other
+3. 细化 `Memory Bound`
+   - 比如区分 L1/L2/DRAM 或 late prefetch 影响
+
+但在当前阶段，这些都属于“精修”，不是基础功能缺失。

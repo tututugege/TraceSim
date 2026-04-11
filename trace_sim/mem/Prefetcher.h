@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../SimConfig.h"
+
 struct PrefetcherAccessInfo {
     uint32_t pc = 0;
     uint32_t addr = 0;
@@ -104,6 +106,25 @@ private:
     std::unordered_map<uint32_t, StrideEntry> table;
 };
 
+class TemplatePrefetcher : public CachePrefetcher {
+public:
+    const char *name() const override { return "template-prefetcher"; }
+
+    void on_access(const PrefetcherAccessInfo &info,
+                   std::vector<PrefetchRequest> &requests) override {
+        if (info.line_size == 0) {
+            return;
+        }
+
+        const uint32_t line_addr = info.addr & ~(info.line_size - 1);
+
+        // Replace this with your own trigger / candidate generation logic.
+        if (info.miss) {
+            requests.push_back(PrefetchRequest{line_addr + info.line_size});
+        }
+    }
+};
+
 inline std::unique_ptr<CachePrefetcher> make_null_prefetcher() {
     return std::make_unique<NullPrefetcher>();
 }
@@ -114,4 +135,17 @@ inline std::unique_ptr<CachePrefetcher> make_next_line_prefetcher() {
 
 inline std::unique_ptr<CachePrefetcher> make_pc_stride_prefetcher() {
     return std::make_unique<PcStridePrefetcher>();
+}
+
+inline std::unique_ptr<CachePrefetcher>
+make_prefetcher(TraceSimConfig::PrefetcherType type) {
+    switch (type) {
+    case TraceSimConfig::PrefetcherType::NEXT_LINE:
+        return make_next_line_prefetcher();
+    case TraceSimConfig::PrefetcherType::PC_STRIDE:
+        return make_pc_stride_prefetcher();
+    case TraceSimConfig::PrefetcherType::NONE:
+    default:
+        return make_null_prefetcher();
+    }
 }
