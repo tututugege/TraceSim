@@ -40,7 +40,7 @@ constexpr uint32_t ALU_COUNT = 4;
 constexpr uint32_t LDU_COUNT = 2;
 constexpr uint32_t STA_COUNT = 2;
 constexpr uint32_t STD_COUNT = 2;
-constexpr uint32_t BRU_COUNT = 1;
+constexpr uint32_t BRU_COUNT = 2;
 
 // =============================================================================
 // 4. 执行延迟 (Execution Latency in cycles)
