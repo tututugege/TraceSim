@@ -1,24 +1,57 @@
-# Build artifacts
-a.out
-TraceSim_gdb
+# Binaries and debug outputs
+/a.out
+/TraceSim_gdb
+*.out
+*.exe
+*.elf
+
+# Object and dependency files
 *.o
+*.obj
+*.lo
 *.d
 
-# Test files and data
-test/
-*.bin
-*.gz
+# Static/shared libraries
+*.a
+*.so
+*.so.*
+*.dylib
 
-# Logs
+# Build directories
+/build/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/Makefile.old
+/autom4te.cache/
+
+# Runtime outputs and experiment artifacts
+/results_ckpt/
+/results/
+/runs/
+/logs/
 *.log
-logs/
 
-# IDE and system files
+# Coverage / profiler artifacts
+*.gcda
+*.gcno
+*.gcov
+gmon.out
+perf.data
+perf.data.old
+
+# Editor / IDE / tooling
 .vscode/
 .idea/
-.DS_Store
 .cache/
 .clangd/
 
+# OS files
+.DS_Store
+Thumbs.db
+
 # Temporary files
 tmp/
+*.tmp
+*.swp
+*.swo
